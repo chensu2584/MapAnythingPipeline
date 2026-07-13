@@ -1,0 +1,11 @@
+# Voxelization only (voxelize.py) — pure CPU, runs on Apple Silicon macOS or Linux.
+numpy
+open3d>=0.17     # first release with Apple Silicon (arm64) wheels
+trimesh
+
+# Full pipeline (undistort.py, run_inference.py, filter_export.py) additionally needs:
+# opencv-python
+# torch            # CUDA build required for run_inference.py
+# mapanything      # not on PyPI — install from source:
+#                  #   git clone https://github.com/facebookresearch/map-anything.git
+#                  #   cd map-anything && pip install -e .
