@@ -1,0 +1,81 @@
+# G2 机器人相机 MapAnything 三维重建 — 工作日志与迁移指南
+
+> 最后更新：2026-07-09。用于未来 resume 工作或迁移到其他机器时快速上手。
+
+## 1. 项目概述
+
+用 [MapAnything](https://github.com/facebookresearch/map-anything)（facebook/map-anything，米制多视图 3D 重建模型）对 G2 机器人的三路 RGB 相机（head 640×400、hand_left / hand_right 1280×1056 广角）做**联合**三维重建，输出米制彩色点云。
+
+- 输入数据仓库：`~/MapAnything/MapAnythingTestData`（GitHub: `chensu2584/MapAnythingTestData`）
+- 模型代码仓库：`~/MapAnything/map-anything`（已生成 CLAUDE.md 供 Claude Code 使用）
+- 本管线脚本：`~/MapAnything/g2_pipeline/`
+- 输出：`~/MapAnything/outputs/`
+
+## 2. 已完成的工作（2026-07-09）
+
+### 环境搭建
+- conda env `mapanything`（Python 3.12），`pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128` + `pip install -e ~/MapAnything/map-anything`
+- **坑**：pip 默认装 torch cu130 wheel，但本机驱动 570.x 只支持 CUDA 12.8，导致 `cuda available: False`，必须用 cu128 index-url 重装（见 §5 迁移注意事项）
+
+### 管线（三个脚本，均在本目录）
+1. **`undistort.py`** — 去畸变。OpenCV Brown–Conrady（JSON 中 k1,k2,p1,p2,k3 与 OpenCV 参数顺序一致），`getOptimalNewCameraMatrix(alpha=0)` → `initUndistortRectifyMap` → `remap` → ROI 裁剪并平移主点。输出去畸变 PNG + `<name>_K.json`（修正后内参）到 `outputs/undistorted/<capture>/`
+2. **`run_inference.py`** — 联合推理。三路图 + 修正内参组成 views → `preprocess_inputs()`（自动统一分辨率到 518 集合、同步缩放内参）→ 一次 `model.infer()` 联合求解（`memory_efficient_inference=True, bf16 AMP`）。输出 `scene.glb/.ply`、`views.npz`、`summary.json`
+3. **`filter_export.py`** — 从 `views.npz` 重新导出（无需 GPU/重推理）。可叠加过滤器 `--max_radius` / `--bbox` / `--min_conf`；`--show_cameras` 在 GLB 中加相机锥台标记（头红、左手绿、右手蓝）。输出 `scene_filtered.glb/.ply`
+
+### 结果（全部 4 个 capture，`--max_radius 2.0`）
+
+| Capture | 过滤后点数（保留率） | 过滤后包围盒 (m) | 基线 头–左/头–右/左–右 (m) |
+|---|---|---|---|
+| 142817 | 356,338 (65.7%) | 3.6×2.3×1.5 | 0.42 / 0.62 / 0.95 |
+| 144239 | 416,984 (79.2%) | 3.2×2.6×1.5 | 0.59 / 0.54 / 0.31 |
+| 144354 | 427,025 (81.7%) | 3.1×2.6×1.6 | 0.56 / 0.51 / 0.33 |
+| 144728 | 435,300 (80.6%) | 3.0×2.7×1.7 | 0.67 / 0.45 / 0.45 |
+
+### GitHub 交付
+- `reconstruction_outputs/` 已推送到 MapAnythingTestData 仓库（commit `5b68be8`）
+- ⚠️ **未完成**：加相机标记后的 GLB 更新（本地 commit `8a71ea0`）推送失败 —— 用户的 fine-grained token 已撤销，**需要新 token 重新 push**
+
+## 3. 关键发现与思考
+
+1. **去畸变是必须的且已定量验证**。MapAnything 全程假设无畸变针孔模型（`geometry.py:154`、`wai/camera.py:208` 明确 "Undistort first"）。手腕广角相机（105° HFOV）角落像素偏移约 140–150 px；去畸变后地面黄线弯曲度从 12.3 px 降至 1.1 px。去畸变后图像边缘的"拉伸感"是**透视拉伸**（正确的针孔投影），不是残余畸变，不要试图去除。
+2. **推理是三路联合的**（单次 `model.infer` 多视图 alternating attention），输出共享世界坐标系（head 相机 = 原点）和全局一致的米制尺度，相机相对位姿是模型的输出而非输入。
+3. **尺度是学出来的先验，无物理锚定**。纯图像+内参输入下，绝对尺度预计有 5–15% 误差。验证手段：用机器人运动学（URDF/FK）的真实头–腕距离对比模型估计的基线；系统性偏差可全局乘系数校正。
+4. **置信度异常是共视不足的信号**。capture 1 头部 conf 1.27、手腕贴地板 1.0；后 3 个 capture 全部视图贴地板（双手举在身前，共视更少）。这类 capture 的跨视图对齐精度要打折扣，`--min_conf` 过滤在这种情况下无效（所有点同值）。
+5. **过滤应在导出层做，不动输入**。远处地面/墙参与推理有利于位姿求解，只是不该出现在最终点云；`views.npz` 存了 `pts3d`+颜色，改过滤参数秒级重导出。
+6. **下一步（用户已确认计划）**：提供相机外参 + 头部深度图后走"图像+内参+深度+位姿"满配模式 —— 外参解决跨视图对齐和尺度锚定，深度锚定头部几何并通过联合推理传播到手腕视图。建议用 `ignore_pose_inputs` / `ignore_depth_inputs` 做三种模式的消融对比。
+
+## 4. 数据格式约定（重要）
+
+### 输入
+- capture 文件夹：`g2_smoke_<timestamp>/`，含 `head.png`、`hand_left.png`、`hand_right.png`（`.npy` 是相同的 RGB 数组，非深度，忽略）
+- 内参 JSON（顶层，按文件名对应相机）：`intrinsic_{head_front,hand_left,hand_right}_rgb.json`，字段 `Fx, Fy, Cx, Cy, k1, k2, p1, p2, k3, SN`，Brown–Conrady 模型，与原始（未去畸变）分辨率对应
+- **给模型的内参必须用去畸变后的 `<name>_K.json` 中的 newK，不是原始 K**
+
+### 未来的外参与深度输入
+- 外参：**OpenCV cam2world 约定**（+X右 +Y下 +Z前），必须是 RGB **光心**位姿（手眼标定结果，不是 URDF link 系，需转换）；去畸变不改变外参，可直接用；view 0（head）必须带位姿
+- 深度：**z-depth**（沿光轴），单位米，配准到去畸变后的 RGB 逐像素对齐，无效像素填 0；每个带物理输入的 view 设 `is_metric_scale=True`
+
+### 输出 `views.npz`（每视图 6 个数组，前缀 `head_` / `hand_left_` / `hand_right_`）
+`_pts3d`（H×W×3 世界坐标，米）、`_depth_z`、`_camera_pose`（4×4 cam2world）、`_intrinsics`、`_conf`、`_mask`、`_img`（uint8 RGB）
+
+### GLB 坐标注意
+`predictions_to_glb` 对整个场景做了 **180° 绕 X 轴翻转**（GLB viewer 朝向习惯）。给 GLB 场景后添加任何几何体（如相机标记）必须应用同样的翻转；`scene.ply` / `views.npz` 是未翻转的原始世界坐标。
+
+## 5. 迁移到其他机器的注意事项
+
+### 环境
+1. Python ≥3.10（本项目用 3.12），先装 torch 再 `pip install -e <map-anything>`
+2. **torch wheel 必须匹配目标机的驱动**：先 `nvidia-smi` 看右上角 CUDA Version，再选 `--index-url https://download.pytorch.org/whl/cuXXX`。pip 默认最新 cu 版本常常超过驱动支持（本机就中招：cu130 wheel vs 12.8 驱动 → CUDA 不可用）
+3. 模型权重缓存在 `~/.cache/huggingface/hub`（`models--facebook--map-anything` + DINOv2 骨干，约 6 GB）。离线机器可直接拷贝这个目录避免下载；在线机器首跑自动下载
+4. GPU 显存：3 视图推理配合 `memory_efficient_inference=True` 实测峰值很小（在只剩 ~24 GB 的共享 H200 上无压力）；更小的卡可加 `minibatch_size=1`
+
+### 脚本
+- 三个脚本的路径常量是硬编码的（`TEST_DATA`、`OUT_ROOT`、`UNDIST_ROOT`，均 `os.path.expanduser("~/MapAnything/...")`），迁移后要么保持相同目录布局，要么改这几个常量（都在文件顶部）
+- capture 列表 `CAPTURES` 也是硬编码的，新数据需更新（或用 `--captures` 参数覆盖）
+- 解释器：脚本无 shebang 依赖，直接用目标机 env 的 python 运行即可
+- 复跑顺序：`undistort.py` → `run_inference.py`（需 GPU）→ `filter_export.py`（纯 CPU，可反复调参数）
+
+### 其他
+- `map-anything` 仓库本体只有代码（18 MB），git clone 即可；本管线只依赖它的 pip 包安装，未修改仓库源码
+- GitHub 推送：MapAnythingTestData 用 fine-grained PAT（需勾选该仓库 + Contents Read/write）；token 不要留在 shell 历史/对话里，用完撤销
+- 数据处理子包 `data_processing/wai_processing` 与主环境冲突（hydra 版本），**不要**装进同一个 env（本项目未用到）
