@@ -15,14 +15,14 @@ import os
 import cv2
 import numpy as np
 
-TEST_DATA = os.path.expanduser("~/MapAnything/MapAnythingTestData")
-OUT_ROOT = os.path.expanduser("~/MapAnything/outputs/undistorted")
+TEST_DATA = "/home/ck/MapAnythingTest/TestData"
+OUT_ROOT = "/home/ck/MapAnythingTest/outputs/undistorted"
 
 CAPTURES = [
-    "g2_smoke_20260702_142817",
-    "g2_smoke_20260702_144239",
-    "g2_smoke_20260702_144354",
-    "g2_smoke_20260702_144728",
+    "g_1_Test_1",
+    "g_1_Test_2",
+    "g_1_Test_3",
+    "g_1_Test_4",
 ]
 
 # image name -> intrinsics json file
@@ -79,7 +79,7 @@ def main():
             img = cv2.imread(img_path, cv2.IMREAD_COLOR)  # BGR
             if img is None:
                 raise FileNotFoundError(img_path)
-            K, dist = load_K_dist(os.path.join(TEST_DATA, intr_file))
+            K, dist = load_K_dist(os.path.join(cap_in, intr_file))
             H, W = img.shape[:2]
             undist, adjK, roi = undistort_image(img, K, dist)
             oh, ow = undist.shape[:2]
@@ -115,3 +115,13 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+"""
+cd /home/ck/MapAnythingTest/MapAnythingPipeline
+conda activate MAP
+
+python undistort.py
+python run_inference.py --captures g_1_Test_1 --max_radius 2.0
+python voxelize.py --captures g_1_Test_1 --voxel_size 0.02 --max_radius 2.0
+"""

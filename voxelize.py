@@ -52,16 +52,11 @@ except (ImportError, OSError) as e:  # OSError: missing libGL on headless server
     o3d = None
     _O3D_IMPORT_ERROR = e
 
-OUT_ROOT = os.path.expanduser("~/MapAnything/outputs")
+OUT_ROOT = "/home/ck/MapAnythingTest/outputs"
 
 VIEW_NAMES = ["head", "hand_left", "hand_right"]
 
-CAPTURES = [
-    "g2_smoke_20260702_142817",
-    "g2_smoke_20260702_144239",
-    "g2_smoke_20260702_144354",
-    "g2_smoke_20260702_144728",
-]
+CAPTURES = ["g_1_Test_1", "g_1_Test_2", "g_1_Test_3", "g_1_Test_4"]
 
 
 def build_filter_mask(pts3d, conf, max_radius=None, bbox=None, min_conf=None):
