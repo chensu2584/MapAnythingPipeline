@@ -79,3 +79,31 @@
 - `map-anything` 仓库本体只有代码（18 MB），git clone 即可；本管线只依赖它的 pip 包安装，未修改仓库源码
 - GitHub 推送：MapAnythingTestData 用 fine-grained PAT（需勾选该仓库 + Contents Read/write）；token 不要留在 shell 历史/对话里，用完撤销
 - 数据处理子包 `data_processing/wai_processing` 与主环境冲突（hydra 版本），**不要**装进同一个 env（本项目未用到）
+
+## 6. 已完成的工作（2026-07-14）— G1 数据 + 外参条件推理
+
+> 本节工作在分支 **`g1-with-extrinsics`**（commit `8edbefe`），即 §3.6 计划中"图像+内参+位姿"模式的落地。
+
+### 新数据集:MapAnythingTestData1(G1 机器人)
+- 仓库 `chensu2584/MapAnythingTestData1`,本地 `~/MapAnything/MapAnythingTestData1`,4 个 capture:`g_1_Test_1..4`
+- 与旧 G2 数据的差异:**内参/外参按 capture 文件夹内置**(不再是仓库顶层共享);相机序列号与标定值和 G2 不同(head SN `CPBC853000EL`),**绝不可复用旧内参**
+- 每个 capture 含:3 张 RGB、`intrinsic_*.json` + pipeline 别名 `intrinsic_*_rgb.json`、四元数外参 `extrinsic_*.json`、**`camera_poses_opencv_cam2world.json`**(4×4 cam2world,OpenCV 约定,世界系=机器人 "end",光心位姿,单位米)、`manifest.json`、`mapanything_views_input.npz`(原始畸变图+原始 K+位姿,不能直接喂,仍需先去畸变)
+
+### 管线改动(4 个脚本)
+1. **路径改为环境变量**:`G2_DATA_ROOT`(capture 父目录)+ `G2_OUT_ROOT`(输出根),默认值为本机路径,跨机器零改码(§5 迁移流程相应简化)
+2. **`undistort.py`**:内参改为从 capture 文件夹内读取;外参 JSON 原样拷贝到去畸变输出目录(去畸变只改 K 不改位姿)
+3. **`run_inference.py`**:读取外参并以 `camera_poses`(4×4 tensor)喂给 `model.infer`;无外参文件时自动回退纯图像+内参模式。**故意不显式传 `is_metric_scale`**——不传时框架默认 True 且生成正确形状的 bool tensor;显式传 Python bool 会在 model.py:924 的 tensor 索引处崩
+
+### 实跑结果(4 captures 全部成功,H200)
+- 每 capture 52–55 万点,有效像素 72–92%;输出基线与外参真值吻合:hand_left↔hand_right 0.191–0.203 m vs 真值 ≈0.199 m → **米制尺度锚定生效**(对比 §3.3 纯图像模式的 5–15% 尺度误差)
+- 输出已推送 `MapAnythingTestData1` main:`724669c`(reconstruction_outputs/)+ `fb22e26`(measure_viewer.html)
+
+### 新工具:measure_viewer.html(两点测距,验证尺度精度)
+- 单个自包含 HTML(3.5 MB,内嵌 g_1_Test_1 六毫米降采样点云),浏览器双击打开、离线可用;单击两点出米制距离,支持拖入任意 `scene.ply` 看全分辨率
+- 严肃精度评估仍推荐 CloudCompare(Tools → Point picking)
+
+### 重要结论/注意事项
+1. **输出世界系 = head 相机系,不是 "end" 系**:模型总把 view 0 归一化为原点(即使喂了世界系位姿)。距离/尺度不受影响,但 `--max_radius`/`--bbox` 在 head 系下生效;要 "end" 系坐标需用 head 外参再变换一次
+2. **外参是条件不是硬约束**:输出位姿仍是模型回归结果,基线相对真值有 ±4% 以内浮动,该浮动属于模型能力范畴
+3. **数据操作链路已审计**:去畸变数学、内参配对、位姿透传、通道顺序均无系统性误差;质量上限由模型 + 518 推理分辨率决定
+4. §2 遗留的 token 问题已解决:MapAnythingTestData1 用新 PAT 推送成功(旧 MapAnythingTestData 的 `8a71ea0` 是否补推,视需要)
