@@ -43,17 +43,13 @@ import trimesh
 from mapanything.utils.geometry import depthmap_to_world_frame
 from mapanything.utils.viz import predictions_to_glb
 
-OUT_ROOT = os.path.expanduser("~/MapAnything/outputs")
-UNDIST_ROOT = os.path.expanduser("~/MapAnything/outputs/undistorted")
+UNDIST_ROOT = os.path.expanduser("~/MapAnythingTest/outputs/undistorted")
+OUT_ROOT = os.path.expanduser("~/MapAnythingTest/outputs")
 
 VIEW_NAMES = ["head", "hand_left", "hand_right"]
 
-CAPTURES = [
-    "g2_smoke_20260702_142817",
-    "g2_smoke_20260702_144239",
-    "g2_smoke_20260702_144354",
-    "g2_smoke_20260702_144728",
-]
+CAPTURES = ["g_1_Test_1", "g_1_Test_2", "g_1_Test_3", "g_1_Test_4"]
+
 
 
 CAM_MARKER_COLORS = {

@@ -52,7 +52,7 @@ except (ImportError, OSError) as e:  # OSError: missing libGL on headless server
     o3d = None
     _O3D_IMPORT_ERROR = e
 
-OUT_ROOT = "/home/ck/MapAnythingTest/outputs"
+OUT_ROOT = os.path.expanduser("~/MapAnythingTest/outputs/")
 
 VIEW_NAMES = ["head", "hand_left", "hand_right"]
 

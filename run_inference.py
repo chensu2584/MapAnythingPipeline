@@ -29,8 +29,8 @@ from mapanything.utils.geometry import depthmap_to_world_frame
 from mapanything.utils.image import preprocess_inputs
 from mapanything.utils.viz import predictions_to_glb
 
-UNDIST_ROOT = "/home/ck/MapAnythingTest/outputs/undistorted"
-OUT_ROOT = "/home/ck/MapAnythingTest/outputs"
+UNDIST_ROOT = os.path.expanduser("~/MapAnythingTest/outputs/undistorted")
+OUT_ROOT = os.path.expanduser("~/MapAnythingTest/outputs")
 
 CAPTURES = ["g_1_Test_1", "g_1_Test_2", "g_1_Test_3", "g_1_Test_4"]
 

@@ -15,8 +15,8 @@ import os
 import cv2
 import numpy as np
 
-TEST_DATA = "/home/ck/MapAnythingTest/TestData"
-OUT_ROOT = "/home/ck/MapAnythingTest/outputs/undistorted"
+TEST_DATA = os.path.expanduser("~/MapAnythingTest/TestData")
+OUT_ROOT = os.path.expanduser("~/MapAnythingTest/outputs/undistorted")
 
 CAPTURES = [
     "g_1_Test_1",
