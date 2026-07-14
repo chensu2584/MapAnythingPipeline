@@ -43,8 +43,8 @@ import trimesh
 from mapanything.utils.geometry import depthmap_to_world_frame
 from mapanything.utils.viz import predictions_to_glb
 
-UNDIST_ROOT = os.path.expanduser("~/MapAnythingTest/outputs/undistorted")
-OUT_ROOT = os.path.expanduser("~/MapAnythingTest/outputs")
+OUT_ROOT = os.path.expanduser(os.environ.get("G2_OUT_ROOT", "~/MapAnything/outputs"))
+UNDIST_ROOT = os.path.join(OUT_ROOT, "undistorted")
 
 VIEW_NAMES = ["head", "hand_left", "hand_right"]
 

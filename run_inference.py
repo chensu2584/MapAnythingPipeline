@@ -3,8 +3,11 @@
 Step B: MapAnything 3D reconstruction inference on undistorted G2 captures.
 
 For each capture:
-  - Load the 3 undistorted images + adjusted newK.
-  - Build views [{"img": HxWx3 uint8, "intrinsics": 3x3}], preprocess_inputs (unify to 518-set).
+  - Load the 3 undistorted images + adjusted newK, plus metric cam2world poses
+    (OpenCV convention, robot "end" frame) when camera_poses_opencv_cam2world.json
+    is present — then the output is metric and registered to the robot frame.
+  - Build views [{"img": HxWx3 uint8, "intrinsics": 3x3, "camera_poses": 4x4}],
+    preprocess_inputs (unify to 518-set).
   - model.infer(..., memory_efficient_inference=True, use_amp, bf16, apply_mask, mask_edges).
   - Save scene.glb, scene.ply, views.npz, summary.json to outputs/<capture>/.
 """
@@ -29,8 +32,9 @@ from mapanything.utils.geometry import depthmap_to_world_frame
 from mapanything.utils.image import preprocess_inputs
 from mapanything.utils.viz import predictions_to_glb
 
-UNDIST_ROOT = os.path.expanduser("~/MapAnythingTest/outputs/undistorted")
-OUT_ROOT = os.path.expanduser("~/MapAnythingTest/outputs")
+# Must match undistort.py's G2_OUT_ROOT (Step A writes into <G2_OUT_ROOT>/undistorted).
+OUT_ROOT = os.path.expanduser(os.environ.get("G2_OUT_ROOT", "~/MapAnything/outputs"))
+UNDIST_ROOT = os.path.join(OUT_ROOT, "undistorted")
 
 CAPTURES = ["g_1_Test_1", "g_1_Test_2", "g_1_Test_3", "g_1_Test_4"]
 
@@ -39,18 +43,39 @@ VIEW_NAMES = ["head", "hand_left", "hand_right"]
 
 def load_views(capture):
     cap_dir = os.path.join(UNDIST_ROOT, capture)
+
+    # Metric cam2world poses (OpenCV convention, world frame = robot "end"),
+    # copied into the undistorted dir by undistort.py. model.infer requires that
+    # if any view has a pose, view 0 has one too — so it's all views or none.
+    poses = None
+    poses_path = os.path.join(cap_dir, "camera_poses_opencv_cam2world.json")
+    if os.path.isfile(poses_path):
+        with open(poses_path) as f:
+            poses = json.load(f)["poses"]
+        missing = [n for n in VIEW_NAMES if n not in poses]
+        if missing:
+            raise KeyError(f"{poses_path} missing poses for views: {missing}")
+        print(f"  using metric camera poses from {os.path.basename(poses_path)}")
+    else:
+        print("  no camera pose file found; model will estimate poses (arbitrary scale)")
+
     views = []
     for name in VIEW_NAMES:
         img_bgr = cv2.imread(os.path.join(cap_dir, f"{name}.png"), cv2.IMREAD_COLOR)
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)  # HxWx3 uint8
         with open(os.path.join(cap_dir, f"{name}_K.json")) as f:
             K = np.array(json.load(f)["K"], dtype=np.float32)
-        views.append(
-            {
-                "img": img_rgb.astype(np.uint8),
-                "intrinsics": torch.from_numpy(K),
-            }
-        )
+        view = {
+            "img": img_rgb.astype(np.uint8),
+            "intrinsics": torch.from_numpy(K),
+        }
+        if poses is not None:
+            # is_metric_scale is deliberately not set: model.infer defaults it to
+            # True (as a correctly-shaped tensor), so these poses are treated as
+            # metric and the output is in the robot "end" frame in meters.
+            pose = np.array(poses[name], dtype=np.float32)
+            view["camera_poses"] = torch.from_numpy(pose)
+        views.append(view)
     return views
 
 

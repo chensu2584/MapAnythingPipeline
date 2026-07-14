@@ -7,16 +7,26 @@ For each capture folder and each of the 3 RGB images (head, hand_left, hand_righ
   2. getOptimalNewCameraMatrix(alpha=0) -> initUndistortRectifyMap -> remap -> crop to ROI.
   3. Shift the new K principal point by the ROI offset.
   4. Save undistorted PNG + <name>_K.json (adjusted newK) to outputs/undistorted/<capture>/.
+Also copies camera_poses_opencv_cam2world.json (extrinsics) through unchanged.
 """
 
 import json
 import os
+import shutil
 
 import cv2
 import numpy as np
 
-TEST_DATA = os.path.expanduser("~/MapAnythingTest/TestData")
-OUT_ROOT = os.path.expanduser("~/MapAnythingTest/outputs/undistorted")
+# Machine-specific roots; override via env vars instead of editing code:
+#   G2_DATA_ROOT: dir containing the capture folders (g_1_Test_*)
+#   G2_OUT_ROOT:  dir where all pipeline outputs are written
+TEST_DATA = os.path.expanduser(
+    os.environ.get("G2_DATA_ROOT", "~/MapAnything/MapAnythingTestData1")
+)
+OUT_ROOT = os.path.join(
+    os.path.expanduser(os.environ.get("G2_OUT_ROOT", "~/MapAnything/outputs")),
+    "undistorted",
+)
 
 CAPTURES = [
     "g_1_Test_1",
@@ -31,6 +41,10 @@ IMAGE_TO_INTRINSIC = {
     "hand_left": "intrinsic_hand_left_rgb.json",
     "hand_right": "intrinsic_hand_right_rgb.json",
 }
+
+# Per-capture camera extrinsics (OpenCV cam2world 4x4, world frame = robot "end").
+# Copied through unchanged: undistortion only modifies K, never the pose.
+POSES_FILE = "camera_poses_opencv_cam2world.json"
 
 
 def load_K_dist(intrinsic_path):
@@ -74,6 +88,12 @@ def main():
         cap_out = os.path.join(OUT_ROOT, capture)
         os.makedirs(cap_out, exist_ok=True)
         print(f"\n=== {capture} ===")
+        poses_src = os.path.join(cap_in, POSES_FILE)
+        if os.path.isfile(poses_src):
+            shutil.copy(poses_src, os.path.join(cap_out, POSES_FILE))
+            print(f"  copied {POSES_FILE}")
+        else:
+            print(f"  WARNING: {POSES_FILE} not found; inference will run without poses")
         for name, intr_file in IMAGE_TO_INTRINSIC.items():
             img_path = os.path.join(cap_in, f"{name}.png")
             img = cv2.imread(img_path, cv2.IMREAD_COLOR)  # BGR
@@ -118,10 +138,15 @@ if __name__ == "__main__":
 
 
 """
-cd /home/ck/MapAnythingTest/MapAnythingPipeline
-conda activate MAP
+Usage (any machine):
+  conda activate MAP   # env with numpy/opencv/torch/mapanything
 
-python undistort.py
-python run_inference.py --captures g_1_Test_1 --max_radius 2.0
-python voxelize.py --captures g_1_Test_1 --voxel_size 0.02 --max_radius 2.0
+  # Point the pipeline at this machine's data/output dirs (defaults shown are
+  # for yizhic3's machine; on ck's machine use ~/MapAnythingTest/TestData etc.):
+  export G2_DATA_ROOT=~/MapAnything/MapAnythingTestData1
+  export G2_OUT_ROOT=~/MapAnything/outputs
+
+  python undistort.py
+  python run_inference.py --captures g_1_Test_1 --max_radius 2.0
+  python voxelize.py --captures g_1_Test_1 --voxel_size 0.02 --max_radius 2.0
 """
