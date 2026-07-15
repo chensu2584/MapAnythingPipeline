@@ -42,9 +42,12 @@ Example:
 import argparse
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 import trimesh
+
+from capture_contract import VIEW_NAMES, resolve_reconstruction_captures
 
 try:
     import open3d as o3d
@@ -52,11 +55,10 @@ except (ImportError, OSError) as e:  # OSError: missing libGL on headless server
     o3d = None
     _O3D_IMPORT_ERROR = e
 
-OUT_ROOT = os.path.expanduser(os.environ.get("G2_OUT_ROOT", "~/MapAnything/outputs"))
-
-VIEW_NAMES = ["head", "hand_left", "hand_right"]
-
-CAPTURES = ["g_1_Test_1", "g_1_Test_2", "g_1_Test_3", "g_1_Test_4"]
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_OUTPUT_ROOT = os.path.expanduser(
+    os.environ.get("G2_OUT_ROOT", str(PROJECT_ROOT / "outputs"))
+)
 
 
 def build_filter_mask(pts3d, conf, max_radius=None, bbox=None, min_conf=None):
@@ -83,10 +85,10 @@ def build_filter_mask(pts3d, conf, max_radius=None, bbox=None, min_conf=None):
     return keep
 
 
-def load_points(capture):
+def load_points(capture, output_root=DEFAULT_OUTPUT_ROOT):
     """Merged filtered-input point cloud from views.npz.
     Returns (pts (N,3) f32, cols (N,3) f32 in [0,1], conf (N,) f32 or None)."""
-    npz = np.load(os.path.join(OUT_ROOT, capture, "views.npz"))
+    npz = np.load(os.path.join(output_root, capture, "views.npz"))
     pts_list, col_list, conf_list = [], [], []
     have_conf = all(f"{n}_conf" in npz for n in VIEW_NAMES)
     for name in VIEW_NAMES:
@@ -184,11 +186,18 @@ def voxels_to_glb_mesh(indices, colors, voxel_size, origin):
     return mesh
 
 
-def process_capture(capture, voxel_size, max_radius=None, bbox=None, min_conf=None):
-    out_dir = os.path.join(OUT_ROOT, capture)
+def process_capture(
+    capture,
+    voxel_size,
+    max_radius=None,
+    bbox=None,
+    min_conf=None,
+    output_root=DEFAULT_OUTPUT_ROOT,
+):
+    out_dir = os.path.join(output_root, capture)
     print(f"\n===== {capture} =====")
 
-    pts, cols, conf = load_points(capture)
+    pts, cols, conf = load_points(capture, output_root)
     n_raw = pts.shape[0]
 
     keep = build_filter_mask(pts, conf, max_radius=max_radius, bbox=bbox, min_conf=min_conf)
@@ -263,7 +272,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Sparse occupancy-grid voxelization from views.npz"
     )
-    parser.add_argument("--captures", nargs="*", default=CAPTURES)
+    parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--captures",
+        nargs="*",
+        default=None,
+        help="Capture folder names; omit to auto-discover folders with views.npz",
+    )
     parser.add_argument(
         "--voxel_size",
         type=float,
@@ -291,9 +306,10 @@ def main():
         help="Pre-filter: keep points with confidence >= this value",
     )
     args = parser.parse_args()
+    captures = resolve_reconstruction_captures(args.output_root, args.captures)
 
     results = []
-    for capture in args.captures:
+    for capture in captures:
         results.append(
             process_capture(
                 capture,
@@ -301,6 +317,7 @@ def main():
                 max_radius=args.max_radius,
                 bbox=args.bbox,
                 min_conf=args.min_conf,
+                output_root=args.output_root,
             )
         )
     print("\n" + json.dumps(results, indent=2))

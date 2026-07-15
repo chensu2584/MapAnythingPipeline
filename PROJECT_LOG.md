@@ -1,6 +1,30 @@
 # G2 机器人相机 MapAnything 三维重建 — 工作日志与迁移指南
 
-> 最后更新：2026-07-14。用于未来 resume 工作或迁移到其他机器时快速上手。
+> 最后更新：2026-07-15。用于未来 resume 工作或迁移到其他机器时快速上手。
+
+## 2026-07-15：G1 GUI capture 输入审查与修正
+
+- 新数据：`TestData/g1_capture_20260715_121059`。
+- 真实数据已通过图像、内参、畸变、RDF cam2world、米制、SO(3)、head identity、
+  baseline 和 MapAnything preprocessing 校验。
+- 移除了四个脚本对旧 `g_1_Test_1..4` 的默认硬编码，改为自动发现或显式
+  `--captures`。
+- Step A/B 默认要求 pose，只有显式 `--allow-missing-poses` 才允许任意尺度模式。
+- 修正旧注释把所有 world frame 误写为 robot `end` 的问题；world 现在来自 pose JSON。
+- 关键语义修正：MapAnything 只把输入 pose 当条件先验并重新预测 pose。最终反投影、
+  `views.npz` 和相机 frustum 现在使用原始标定 pose；模型预测 pose 单独保存做诊断。
+- 新增 `capture_contract.py`、`--validate-only`、preprocess manifest、provenance 复制和
+  6 个回归测试。
+- 真实 capture 的 Step A + Step B validate-only 冒烟通过：输出尺寸 head 1279×719、
+  wrists 847×479；模型输入统一为 518×294；所有 pose preprocess diff 为 0。
+- CPU 确定性假模型完整走通 inference 后处理、GLB/PLY/NPZ、filter/frustum 和 voxelize；
+  导出 pose 与源 JSON 差为 0，numpy/Open3D voxel IoU 为 1.0。
+- 当前机器 NVIDIA 驱动不可用，尚未执行本次新数据的完整模型推理/视觉验收。
+  详细审查见 `G1_CAPTURE_PIPELINE_AUDIT_20260715.md`。
+- 后续完整输出证明三路相机中心没有合并；异常是 head 点云在 +Z、两腕点云在 -Z。
+  四种 wrist parent/direction 候选都不能消除负 Z，下一优先级是确认 wrist JSON 的
+  raw camera frame 到 RGB OpenCV optical 的固定轴转换。新增按视图着色/frustum 诊断
+  GLB，并修复 inference-time filter 导致 `filter_export.py` 点数误断言的问题。
 
 ## 1. 项目概述
 

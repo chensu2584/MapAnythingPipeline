@@ -1,11 +1,10 @@
 #!/usr/bin/env python
 """
-Step B: MapAnything 3D reconstruction inference on undistorted G2 captures.
+Step B: MapAnything 3D reconstruction inference on undistorted G1/G2 captures.
 
 For each capture:
-  - Load the 3 undistorted images + adjusted newK, plus metric cam2world poses
-    (OpenCV convention, robot "end" frame) when camera_poses_opencv_cam2world.json
-    is present — then the output is metric and registered to the robot frame.
+  - Load the 3 undistorted images + adjusted newK, plus validated metric OpenCV
+    RDF cam2world poses. The world frame is read from the pose document.
   - Build views [{"img": HxWx3 uint8, "intrinsics": 3x3, "camera_poses": 4x4}],
     preprocess_inputs (unify to 518-set).
   - model.infer(..., memory_efficient_inference=True, use_amp, bf16, apply_mask, mask_edges).
@@ -15,7 +14,9 @@ For each capture:
 import argparse
 import json
 import os
+import shutil
 import sys
+from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -26,6 +27,13 @@ import trimesh
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from filter_export import build_filter_mask
+from capture_contract import (
+    POSES_FILE,
+    PROVENANCE_FILES,
+    VIEW_NAMES,
+    resolve_captures,
+    validate_pose_document,
+)
 
 from mapanything.models import MapAnything
 from mapanything.utils.geometry import depthmap_to_world_frame
@@ -33,61 +41,126 @@ from mapanything.utils.image import preprocess_inputs
 from mapanything.utils.viz import predictions_to_glb
 
 # Must match undistort.py's G2_OUT_ROOT (Step A writes into <G2_OUT_ROOT>/undistorted).
-OUT_ROOT = os.path.expanduser(os.environ.get("G2_OUT_ROOT", "~/MapAnything/outputs"))
-UNDIST_ROOT = os.path.join(OUT_ROOT, "undistorted")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_OUTPUT_ROOT = os.path.expanduser(
+    os.environ.get("G2_OUT_ROOT", str(PROJECT_ROOT / "outputs"))
+)
+DEFAULT_UNDIST_ROOT = os.path.join(DEFAULT_OUTPUT_ROOT, "undistorted")
 
-CAPTURES = ["g_1_Test_1", "g_1_Test_2", "g_1_Test_3", "g_1_Test_4"]
 
-VIEW_NAMES = ["head", "hand_left", "hand_right"]
+def _load_adjusted_K(path, image_width, image_height):
+    try:
+        with Path(path).open(encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read adjusted intrinsics {path}: {exc}") from exc
+    K = np.asarray(data.get("K"), dtype=np.float32)
+    if K.shape != (3, 3) or not np.isfinite(K).all():
+        raise ValueError(f"{path} must contain a finite 3x3 K matrix")
+    if K[0, 0] <= 0 or K[1, 1] <= 0 or not np.allclose(K[2], [0, 0, 1]):
+        raise ValueError(f"{path} contains an invalid pinhole K matrix")
+    if not (0 <= K[0, 2] < image_width and 0 <= K[1, 2] < image_height):
+        raise ValueError(f"{path} principal point lies outside the image")
+    declared_size = (data.get("width"), data.get("height"))
+    if declared_size != (image_width, image_height):
+        raise ValueError(
+            f"{path} declares size {declared_size}, image is {(image_width, image_height)}"
+        )
+    return K
 
 
-def load_views(capture):
-    cap_dir = os.path.join(UNDIST_ROOT, capture)
+def load_views(capture, undist_root=DEFAULT_UNDIST_ROOT, allow_missing_poses=False):
+    cap_dir = Path(undist_root) / capture
 
-    # Metric cam2world poses (OpenCV convention, world frame = robot "end"),
-    # copied into the undistorted dir by undistort.py. model.infer requires that
-    # if any view has a pose, view 0 has one too — so it's all views or none.
     poses = None
-    poses_path = os.path.join(cap_dir, "camera_poses_opencv_cam2world.json")
-    if os.path.isfile(poses_path):
-        with open(poses_path) as f:
-            poses = json.load(f)["poses"]
-        missing = [n for n in VIEW_NAMES if n not in poses]
-        if missing:
-            raise KeyError(f"{poses_path} missing poses for views: {missing}")
-        print(f"  using metric camera poses from {os.path.basename(poses_path)}")
+    pose_contract = None
+    poses_path = cap_dir / POSES_FILE
+    if poses_path.is_file():
+        poses, pose_contract = validate_pose_document(poses_path)
+        print(
+            f"  using metric poses: {pose_contract['frame_convention']}, "
+            f"world={pose_contract['world_frame']}, unit=m"
+        )
+    elif not allow_missing_poses:
+        raise FileNotFoundError(
+            f"{poses_path} is required for metric reconstruction; "
+            "use --allow-missing-poses only for intentional pose-free inference"
+        )
     else:
         print("  no camera pose file found; model will estimate poses (arbitrary scale)")
 
     views = []
     for name in VIEW_NAMES:
-        img_bgr = cv2.imread(os.path.join(cap_dir, f"{name}.png"), cv2.IMREAD_COLOR)
+        image_path = cap_dir / f"{name}.png"
+        img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            raise FileNotFoundError(f"Cannot read image: {image_path}")
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)  # HxWx3 uint8
-        with open(os.path.join(cap_dir, f"{name}_K.json")) as f:
-            K = np.array(json.load(f)["K"], dtype=np.float32)
+        height, width = img_rgb.shape[:2]
+        K = _load_adjusted_K(cap_dir / f"{name}_K.json", width, height)
         view = {
             "img": img_rgb.astype(np.uint8),
             "intrinsics": torch.from_numpy(K),
         }
         if poses is not None:
-            # is_metric_scale is deliberately not set: model.infer defaults it to
-            # True (as a correctly-shaped tensor), so these poses are treated as
-            # metric and the output is in the robot "end" frame in meters.
-            pose = np.array(poses[name], dtype=np.float32)
+            pose = np.asarray(poses[name], dtype=np.float32)
             view["camera_poses"] = torch.from_numpy(pose)
+            view["is_metric_scale"] = torch.ones(1, dtype=torch.bool)
         views.append(view)
-    return views
+    return views, pose_contract
+
+
+def validate_preprocessed_views(raw_views, processed_views):
+    if len(processed_views) != len(VIEW_NAMES):
+        raise ValueError(f"Expected {len(VIEW_NAMES)} processed views")
+    report = {"view_order": list(VIEW_NAMES), "views": {}}
+    for name, raw, processed in zip(VIEW_NAMES, raw_views, processed_views):
+        image = processed["img"]
+        K = processed["intrinsics"]
+        if image.ndim != 4 or image.shape[0] != 1 or image.shape[1] != 3:
+            raise ValueError(f"Processed {name} image has invalid shape {tuple(image.shape)}")
+        if K.shape != (1, 3, 3) or not torch.isfinite(K).all():
+            raise ValueError(f"Processed {name} intrinsics have invalid shape/values")
+        pose_diff = None
+        if "camera_poses" in raw:
+            processed_pose = processed.get("camera_poses")
+            if processed_pose is None or processed_pose.shape != (1, 4, 4):
+                raise ValueError(f"Processed {name} pose has invalid shape")
+            pose_diff = float(
+                torch.max(torch.abs(processed_pose[0] - raw["camera_poses"])).item()
+            )
+            if pose_diff > 1e-6:
+                raise ValueError(f"Preprocessing changed {name} pose by {pose_diff}")
+            metric = processed.get("is_metric_scale")
+            if metric is None or metric.shape != (1,) or not bool(metric[0]):
+                raise ValueError(f"Processed {name} is not explicitly marked metric")
+        report["views"][name] = {
+            "model_input_resolution_hw": [int(image.shape[2]), int(image.shape[3])],
+            "pose_preprocess_max_abs_diff": pose_diff,
+        }
+    return report
 
 
 def run_capture(
-    model, capture, minibatch_size=None, max_radius=None, bbox=None, min_conf=None
+    model,
+    capture,
+    minibatch_size=None,
+    max_radius=None,
+    bbox=None,
+    min_conf=None,
+    undist_root=DEFAULT_UNDIST_ROOT,
+    output_root=DEFAULT_OUTPUT_ROOT,
+    allow_missing_poses=False,
 ):
-    out_dir = os.path.join(OUT_ROOT, capture)
+    out_dir = os.path.join(output_root, capture)
     os.makedirs(out_dir, exist_ok=True)
     print(f"\n===== {capture} =====")
 
-    views = load_views(capture)
+    views, pose_contract = load_views(capture, undist_root, allow_missing_poses)
     processed = preprocess_inputs(views)
+    preprocess_report = validate_preprocessed_views(views, processed)
+    if pose_contract is None and any(v is not None for v in (max_radius, bbox)):
+        raise ValueError("Metric radius/bbox filters require metric camera poses")
 
     infer_kwargs = dict(
         memory_efficient_inference=True,
@@ -100,20 +173,40 @@ def run_capture(
         infer_kwargs["minibatch_size"] = minibatch_size
 
     outputs = model.infer(processed, **infer_kwargs)
+    if len(outputs) != len(VIEW_NAMES):
+        raise RuntimeError(f"Model returned {len(outputs)} views, expected {len(VIEW_NAMES)}")
 
     world_points_list = []
     images_list = []
     masks_list = []
 
     npz = {}
-    summary = {"capture": capture, "views": []}
+    summary = {
+        "capture": capture,
+        "metric_pose_input": pose_contract is not None,
+        "pose_contract": pose_contract,
+        "preprocess_validation": preprocess_report,
+        "camera_pose_used_for_export": (
+            "calibrated_input_pose" if pose_contract is not None else "model_prediction"
+        ),
+        "views": [],
+    }
     cam_translations = []
+    input_head_pose = processed[0].get("camera_poses")
 
     for view_idx, pred in enumerate(outputs):
         name = VIEW_NAMES[view_idx]
         depthmap = pred["depth_z"][0].squeeze(-1)  # (H, W)
         intrinsics = pred["intrinsics"][0]  # (3, 3)
-        cam_pose = pred["camera_poses"][0]  # (4, 4) cam2world
+        model_cam_pose = pred["camera_poses"][0]
+        # Input poses are conditions, not hard constraints in MapAnything. When
+        # calibrated poses exist, use them for final unprojection/export so the
+        # result stays exactly in the capture's declared world frame.
+        cam_pose = (
+            processed[view_idx]["camera_poses"][0]
+            if pose_contract is not None
+            else model_cam_pose
+        )
 
         pts3d, valid_mask = depthmap_to_world_frame(depthmap, intrinsics, cam_pose)
 
@@ -125,6 +218,7 @@ def run_capture(
         conf_np = pred["conf"][0].squeeze(-1).cpu().numpy() if "conf" in pred else None
         K_np = intrinsics.cpu().numpy()
         pose_np = cam_pose.cpu().numpy()
+        model_pose_np = model_cam_pose.cpu().numpy()
 
         world_points_list.append(pts3d_np)
         images_list.append(image_np)
@@ -134,6 +228,9 @@ def run_capture(
         npz[f"{name}_depth_z"] = depth_np.astype(np.float32)
         npz[f"{name}_intrinsics"] = K_np.astype(np.float32)
         npz[f"{name}_camera_pose"] = pose_np.astype(np.float32)
+        npz[f"{name}_model_camera_pose_head_reference"] = model_pose_np.astype(
+            np.float32
+        )
         npz[f"{name}_mask"] = mask
         npz[f"{name}_pts3d"] = pts3d_np.astype(np.float32)
         npz[f"{name}_img"] = np.clip(image_np * 255.0, 0.0, 255.0).astype(np.uint8)
@@ -159,6 +256,18 @@ def run_capture(
 
         trans = pose_np[:3, 3]
         cam_translations.append(trans)
+        pose_prior_error = None
+        if pose_contract is not None:
+            head_T_world = torch.linalg.inv(input_head_pose[0])
+            input_pose_head_reference = (
+                head_T_world @ processed[view_idx]["camera_poses"][0]
+            ).cpu().numpy()
+            delta = np.linalg.inv(input_pose_head_reference) @ model_pose_np
+            cos_angle = np.clip((np.trace(delta[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)
+            pose_prior_error = {
+                "model_vs_input_translation_m": float(np.linalg.norm(delta[:3, 3])),
+                "model_vs_input_rotation_deg": float(np.degrees(np.arccos(cos_angle))),
+            }
 
         summary["views"].append(
             {
@@ -168,6 +277,7 @@ def run_capture(
                 "conf_mean": round(c_mean, 4),
                 "conf_median": round(c_med, 4),
                 "camera_translation": [round(float(x), 4) for x in trans],
+                "pose_prior_diagnostic": pose_prior_error,
                 "depth_min": round(d_min, 4),
                 "depth_median": round(d_med, 4),
                 "depth_max": round(d_max, 4),
@@ -242,6 +352,14 @@ def run_capture(
 
     # summary
     summary["num_points"] = int(all_pts.shape[0])
+    copied_provenance = []
+    source_dir = Path(undist_root) / capture
+    for filename in (*PROVENANCE_FILES, "pipeline_preprocess_manifest.json", POSES_FILE):
+        source = source_dir / filename
+        if source.is_file():
+            shutil.copy2(source, Path(out_dir) / filename)
+            copied_provenance.append(filename)
+    summary["copied_provenance_files"] = copied_provenance
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -255,7 +373,25 @@ def run_capture(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--captures", nargs="*", default=CAPTURES)
+    parser.add_argument("--input-root", default=DEFAULT_UNDIST_ROOT)
+    parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--captures",
+        nargs="*",
+        default=None,
+        help="Capture folder names; omit to auto-discover preprocessed captures",
+    )
+    parser.add_argument(
+        "--allow-missing-poses",
+        action="store_true",
+        help="Allow intentional pose-free, arbitrary-scale inference",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Validate/load/preprocess inputs without loading the model or using CUDA",
+    )
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--minibatch_size", type=int, default=None)
     parser.add_argument(
         "--max_radius",
@@ -278,25 +414,54 @@ def main():
         help="Export filter: keep points with confidence >= this value",
     )
     args = parser.parse_args()
+    captures = resolve_captures(args.input_root, args.captures, preprocessed=True)
     filter_kwargs = dict(
         max_radius=args.max_radius, bbox=args.bbox, min_conf=args.min_conf
     )
 
+    if args.validate_only:
+        print(f"Validating captures: {', '.join(captures)}")
+        for capture in captures:
+            print(f"\n===== {capture} =====")
+            views, contract = load_views(
+                capture, args.input_root, args.allow_missing_poses
+            )
+            report = validate_preprocessed_views(views, preprocess_inputs(views))
+            print(json.dumps({"pose_contract": contract, **report}, indent=2))
+        print("\nValidation complete; model was not loaded.")
+        return
+
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is unavailable. Fix the NVIDIA driver/runtime or run --validate-only."
+        )
     print("Loading MapAnything model...")
-    model = MapAnything.from_pretrained("facebook/map-anything").to("cuda")
+    model = MapAnything.from_pretrained("facebook/map-anything").to(args.device)
     model.eval()
 
     all_summaries = {}
-    for capture in args.captures:
+    for capture in captures:
         try:
             all_summaries[capture] = run_capture(
-                model, capture, minibatch_size=args.minibatch_size, **filter_kwargs
+                model,
+                capture,
+                minibatch_size=args.minibatch_size,
+                undist_root=args.input_root,
+                output_root=args.output_root,
+                allow_missing_poses=args.allow_missing_poses,
+                **filter_kwargs,
             )
         except torch.cuda.OutOfMemoryError as e:
             print(f"  OOM on {capture}: {e}\n  retrying with minibatch_size=1")
             torch.cuda.empty_cache()
             all_summaries[capture] = run_capture(
-                model, capture, minibatch_size=1, **filter_kwargs
+                model,
+                capture,
+                minibatch_size=1,
+                undist_root=args.input_root,
+                output_root=args.output_root,
+                allow_missing_poses=args.allow_missing_poses,
+                **filter_kwargs,
             )
 
     print("\nAll done.")
