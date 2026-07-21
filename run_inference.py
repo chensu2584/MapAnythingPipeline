@@ -1,20 +1,31 @@
 #!/usr/bin/env python
 """
-Step B: MapAnything 3D reconstruction inference on undistorted G2 captures.
+Step B: MapAnything 3D reconstruction inference on undistorted G1/G2 captures.
 
 For each capture:
-  - Load the 3 undistorted images + adjusted newK.
-  - Build views [{"img": HxWx3 uint8, "intrinsics": 3x3}], preprocess_inputs (unify to 518-set).
+  - Load the 3 undistorted images + adjusted newK, plus validated metric OpenCV
+    RDF cam2world poses used as model conditions and a world-frame head anchor.
+  - Build views [{"img": HxWx3 uint8, "intrinsics": 3x3, "camera_poses": 4x4}],
+    preprocess_inputs (unify to 518-set).
   - model.infer(..., memory_efficient_inference=True, use_amp, bf16, apply_mask, mask_edges).
+  - By default fit one uniform scale from camera baselines, apply it to model depth
+    and relative translations, then rigidly anchor the calibrated head pose.
   - Save scene.glb, scene.ply, views.npz, summary.json to outputs/<capture>/.
 """
 
 import argparse
 import json
 import os
+import shutil
 import sys
+import time
+from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ.setdefault(
+    "MPLCONFIGDIR",
+    os.path.join(os.environ.get("TMPDIR", "/tmp"), "mapanything-matplotlib-cache"),
+)
 
 import cv2
 import numpy as np
@@ -23,49 +34,196 @@ import trimesh
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from filter_export import build_filter_mask
+from pose_export import (
+    CALIBRATED_INPUT,
+    DEFAULT_POSE_EXPORT_MODE,
+    MODEL_PREDICTION_ARBITRARY_SCALE,
+    MODEL_RELATIVE_HEAD_ANCHORED,
+    MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED,
+    POSE_EXPORT_MODES,
+    pose_delta,
+    select_export_poses,
+)
+from capture_contract import (
+    POSES_FILE,
+    PROVENANCE_FILES,
+    VIEW_NAMES,
+    resolve_captures,
+    validate_pose_document,
+)
 
 from mapanything.models import MapAnything
 from mapanything.utils.geometry import depthmap_to_world_frame
 from mapanything.utils.image import preprocess_inputs
 from mapanything.utils.viz import predictions_to_glb
 
-UNDIST_ROOT = os.path.expanduser("~/MapAnythingTest/outputs/undistorted")
-OUT_ROOT = os.path.expanduser("~/MapAnythingTest/outputs")
+# Must match undistort.py's G2_OUT_ROOT (Step A writes into <G2_OUT_ROOT>/undistorted).
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_OUTPUT_ROOT = os.path.expanduser(
+    os.environ.get("G2_OUT_ROOT", str(PROJECT_ROOT / "outputs"))
+)
+DEFAULT_UNDIST_ROOT = os.path.join(DEFAULT_OUTPUT_ROOT, "undistorted")
 
-CAPTURES = ["g_1_Test_1", "g_1_Test_2", "g_1_Test_3", "g_1_Test_4"]
 
-VIEW_NAMES = ["head", "hand_left", "hand_right"]
+def _timing_value(seconds):
+    return round(float(seconds), 6)
 
 
-def load_views(capture):
-    cap_dir = os.path.join(UNDIST_ROOT, capture)
+def _print_timing(label, seconds):
+    print(f"  [TIMING] {label}: {float(seconds):.3f} s")
+
+
+def _synchronize_model_device(model):
+    """Synchronize CUDA only at timing boundaries so GPU timings are meaningful."""
+
+    device = getattr(model, "device", None)
+    if device is None:
+        return
+    device = torch.device(device)
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def _load_adjusted_K(path, image_width, image_height):
+    try:
+        with Path(path).open(encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read adjusted intrinsics {path}: {exc}") from exc
+    K = np.asarray(data.get("K"), dtype=np.float32)
+    if K.shape != (3, 3) or not np.isfinite(K).all():
+        raise ValueError(f"{path} must contain a finite 3x3 K matrix")
+    if K[0, 0] <= 0 or K[1, 1] <= 0 or not np.allclose(K[2], [0, 0, 1]):
+        raise ValueError(f"{path} contains an invalid pinhole K matrix")
+    if not (0 <= K[0, 2] < image_width and 0 <= K[1, 2] < image_height):
+        raise ValueError(f"{path} principal point lies outside the image")
+    declared_size = (data.get("width"), data.get("height"))
+    if declared_size != (image_width, image_height):
+        raise ValueError(
+            f"{path} declares size {declared_size}, image is {(image_width, image_height)}"
+        )
+    return K
+
+
+def load_views(
+    capture,
+    undist_root=DEFAULT_UNDIST_ROOT,
+    allow_missing_poses=False,
+    ignore_poses=False,
+):
+    cap_dir = Path(undist_root) / capture
+
+    poses = None
+    pose_contract = None
+    poses_path = cap_dir / POSES_FILE
+    if ignore_poses:
+        print("  metric pose file explicitly ignored; model will estimate pose/scale")
+    elif poses_path.is_file():
+        poses, pose_contract = validate_pose_document(poses_path)
+        print(
+            f"  using metric poses: {pose_contract['frame_convention']}, "
+            f"world={pose_contract['world_frame']}, unit=m"
+        )
+    elif not allow_missing_poses:
+        raise FileNotFoundError(
+            f"{poses_path} is required for metric reconstruction; "
+            "use --allow-missing-poses only for intentional pose-free inference"
+        )
+    else:
+        print("  no camera pose file found; model will estimate poses (arbitrary scale)")
+
     views = []
     for name in VIEW_NAMES:
-        img_bgr = cv2.imread(os.path.join(cap_dir, f"{name}.png"), cv2.IMREAD_COLOR)
+        image_path = cap_dir / f"{name}.png"
+        img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            raise FileNotFoundError(f"Cannot read image: {image_path}")
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)  # HxWx3 uint8
-        with open(os.path.join(cap_dir, f"{name}_K.json")) as f:
-            K = np.array(json.load(f)["K"], dtype=np.float32)
-        views.append(
-            {
-                "img": img_rgb.astype(np.uint8),
-                "intrinsics": torch.from_numpy(K),
-            }
-        )
-    return views
+        height, width = img_rgb.shape[:2]
+        K = _load_adjusted_K(cap_dir / f"{name}_K.json", width, height)
+        view = {
+            "img": img_rgb.astype(np.uint8),
+            "intrinsics": torch.from_numpy(K),
+        }
+        if poses is not None:
+            pose = np.asarray(poses[name], dtype=np.float32)
+            view["camera_poses"] = torch.from_numpy(pose)
+            view["is_metric_scale"] = torch.ones(1, dtype=torch.bool)
+        views.append(view)
+    return views, pose_contract
+
+
+def validate_preprocessed_views(raw_views, processed_views):
+    if len(processed_views) != len(VIEW_NAMES):
+        raise ValueError(f"Expected {len(VIEW_NAMES)} processed views")
+    report = {"view_order": list(VIEW_NAMES), "views": {}}
+    for name, raw, processed in zip(VIEW_NAMES, raw_views, processed_views):
+        image = processed["img"]
+        K = processed["intrinsics"]
+        if image.ndim != 4 or image.shape[0] != 1 or image.shape[1] != 3:
+            raise ValueError(f"Processed {name} image has invalid shape {tuple(image.shape)}")
+        if K.shape != (1, 3, 3) or not torch.isfinite(K).all():
+            raise ValueError(f"Processed {name} intrinsics have invalid shape/values")
+        pose_diff = None
+        if "camera_poses" in raw:
+            processed_pose = processed.get("camera_poses")
+            if processed_pose is None or processed_pose.shape != (1, 4, 4):
+                raise ValueError(f"Processed {name} pose has invalid shape")
+            pose_diff = float(
+                torch.max(torch.abs(processed_pose[0] - raw["camera_poses"])).item()
+            )
+            if pose_diff > 1e-6:
+                raise ValueError(f"Preprocessing changed {name} pose by {pose_diff}")
+            metric = processed.get("is_metric_scale")
+            if metric is None or metric.shape != (1,) or not bool(metric[0]):
+                raise ValueError(f"Processed {name} is not explicitly marked metric")
+        report["views"][name] = {
+            "model_input_resolution_hw": [int(image.shape[2]), int(image.shape[3])],
+            "pose_preprocess_max_abs_diff": pose_diff,
+        }
+    return report
 
 
 def run_capture(
-    model, capture, minibatch_size=None, max_radius=None, bbox=None, min_conf=None
+    model,
+    capture,
+    minibatch_size=None,
+    max_radius=None,
+    bbox=None,
+    min_conf=None,
+    undist_root=DEFAULT_UNDIST_ROOT,
+    output_root=DEFAULT_OUTPUT_ROOT,
+    allow_missing_poses=False,
+    ignore_poses=False,
+    pose_export_mode=DEFAULT_POSE_EXPORT_MODE,
+    memory_efficient_inference=True,
 ):
-    out_dir = os.path.join(OUT_ROOT, capture)
+    capture_started_at = time.perf_counter()
+    timings = {}
+    out_dir = os.path.join(output_root, capture)
     os.makedirs(out_dir, exist_ok=True)
     print(f"\n===== {capture} =====")
 
-    views = load_views(capture)
+    section_started_at = time.perf_counter()
+    views, pose_contract = load_views(
+        capture,
+        undist_root,
+        allow_missing_poses,
+        ignore_poses=ignore_poses,
+    )
+    timings["input_load"] = time.perf_counter() - section_started_at
+    _print_timing("input_load", timings["input_load"])
+
+    section_started_at = time.perf_counter()
     processed = preprocess_inputs(views)
+    preprocess_report = validate_preprocessed_views(views, processed)
+    timings["preprocess_inputs"] = time.perf_counter() - section_started_at
+    _print_timing("preprocess_inputs", timings["preprocess_inputs"])
+    if pose_contract is None and any(v is not None for v in (max_radius, bbox)):
+        raise ValueError("Metric radius/bbox filters require metric camera poses")
 
     infer_kwargs = dict(
-        memory_efficient_inference=True,
+        memory_efficient_inference=memory_efficient_inference,
         use_amp=True,
         amp_dtype="bf16",
         apply_mask=True,
@@ -74,21 +232,126 @@ def run_capture(
     if minibatch_size is not None:
         infer_kwargs["minibatch_size"] = minibatch_size
 
+    print(
+        "  inference dense-head mode: "
+        + ("memory-efficient" if memory_efficient_inference else "fast/all-views")
+    )
+    _synchronize_model_device(model)
+    section_started_at = time.perf_counter()
     outputs = model.infer(processed, **infer_kwargs)
+    _synchronize_model_device(model)
+    timings["model_inference"] = time.perf_counter() - section_started_at
+    _print_timing("model_inference", timings["model_inference"])
+    if len(outputs) != len(VIEW_NAMES):
+        raise RuntimeError(f"Model returned {len(outputs)} views, expected {len(VIEW_NAMES)}")
+
+    section_started_at = time.perf_counter()
+    model_pose_arrays = [
+        pred["camera_poses"][0].detach().cpu().numpy().astype(np.float64)
+        for pred in outputs
+    ]
+    calibrated_pose_arrays = (
+        [
+            view["camera_poses"][0].detach().cpu().numpy().astype(np.float64)
+            for view in processed
+        ]
+        if pose_contract is not None
+        else None
+    )
+    (
+        export_pose_arrays,
+        effective_pose_mode,
+        world_t_model_reference,
+        scale_report,
+    ) = (
+        select_export_poses(
+            model_pose_arrays,
+            calibrated_pose_arrays,
+            requested_mode=pose_export_mode,
+        )
+    )
+    pose_mode_labels = {
+        MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED: (
+            "model_prediction_baseline_scaled_and_rigidly_anchored_to_calibrated_head"
+        ),
+        MODEL_RELATIVE_HEAD_ANCHORED: "model_prediction_rigidly_anchored_to_calibrated_head",
+        CALIBRATED_INPUT: "calibrated_input_pose_legacy_hybrid",
+        MODEL_PREDICTION_ARBITRARY_SCALE: "model_prediction_arbitrary_scale",
+    }
+    print(
+        f"  pose export mode: requested={pose_export_mode}, "
+        f"effective={effective_pose_mode}"
+    )
+    similarity_scale = scale_report["scale"] if scale_report is not None else 1.0
+    scale_metadata = scale_report or {
+        "applied": False,
+        "scale": 1.0,
+        "estimator": None,
+    }
+    if scale_report is not None:
+        print(
+            f"  baseline similarity scale: {similarity_scale:.6f} | "
+            f"baseline RMSE {scale_report['baseline_rmse_before_m'] * 1000:.2f} -> "
+            f"{scale_report['baseline_rmse_after_m'] * 1000:.2f} mm"
+        )
 
     world_points_list = []
     images_list = []
     masks_list = []
 
     npz = {}
-    summary = {"capture": capture, "views": []}
+    summary = {
+        "capture": capture,
+        "metric_pose_input": pose_contract is not None,
+        "pose_input_mode": "ignored" if ignore_poses else "metric_if_available",
+        "pose_contract": pose_contract,
+        "preprocess_validation": preprocess_report,
+        "memory_efficient_inference": bool(memory_efficient_inference),
+        "pose_export_mode_requested": pose_export_mode,
+        "pose_export_mode_effective": effective_pose_mode,
+        "camera_pose_used_for_export": pose_mode_labels[effective_pose_mode],
+        "similarity_scale_correction": scale_metadata,
+        "pose_anchor": (
+            {
+                "reference_view": VIEW_NAMES[0],
+                "operation": (
+                    "uniform_similarity_about_model_head_then_rigid_head_anchor"
+                    if scale_report is not None
+                    else "rigid_head_anchor"
+                ),
+                "formula": (
+                    "model_head_T_camera = inverse(model_reference_T_head) @ "
+                    "model_reference_T_camera; "
+                    "model_head_T_camera.translation *= similarity_scale; "
+                    "world_T_camera = calibrated_world_T_head @ model_head_T_camera"
+                ),
+                "world_T_model_reference": world_t_model_reference.tolist(),
+            }
+            if world_t_model_reference is not None
+            else None
+        ),
+        "views": [],
+    }
     cam_translations = []
+    npz["pose_export_similarity_scale"] = np.asarray(
+        similarity_scale, dtype=np.float32
+    )
 
     for view_idx, pred in enumerate(outputs):
         name = VIEW_NAMES[view_idx]
-        depthmap = pred["depth_z"][0].squeeze(-1)  # (H, W)
+        model_depthmap = pred["depth_z"][0].squeeze(-1)  # (H, W), already metric-head scaled
+        depthmap = model_depthmap * similarity_scale
         intrinsics = pred["intrinsics"][0]  # (3, 3)
-        cam_pose = pred["camera_poses"][0]  # (4, 4) cam2world
+        model_cam_pose = pred["camera_poses"][0]
+        # Keep network depth and network relative camera geometry self-consistent.
+        # In the default metric mode one uniform similarity correction is applied
+        # to both depth and head-relative camera translations, followed by a rigid
+        # head anchor. This preserves the model's multi-view alignment.
+        cam_pose = torch.as_tensor(
+            export_pose_arrays[view_idx],
+            dtype=model_cam_pose.dtype,
+            device=model_cam_pose.device,
+        )
 
         pts3d, valid_mask = depthmap_to_world_frame(depthmap, intrinsics, cam_pose)
 
@@ -100,6 +363,12 @@ def run_capture(
         conf_np = pred["conf"][0].squeeze(-1).cpu().numpy() if "conf" in pred else None
         K_np = intrinsics.cpu().numpy()
         pose_np = cam_pose.cpu().numpy()
+        model_pose_np = model_cam_pose.cpu().numpy()
+        model_metric_scaling_factor = None
+        if "metric_scaling_factor" in pred:
+            model_metric_scaling_factor = float(
+                pred["metric_scaling_factor"].detach().cpu().reshape(-1)[0].item()
+            )
 
         world_points_list.append(pts3d_np)
         images_list.append(image_np)
@@ -109,6 +378,17 @@ def run_capture(
         npz[f"{name}_depth_z"] = depth_np.astype(np.float32)
         npz[f"{name}_intrinsics"] = K_np.astype(np.float32)
         npz[f"{name}_camera_pose"] = pose_np.astype(np.float32)
+        npz[f"{name}_model_camera_pose_head_reference"] = model_pose_np.astype(
+            np.float32
+        )
+        if model_metric_scaling_factor is not None:
+            npz[f"{name}_model_metric_scaling_factor"] = np.asarray(
+                model_metric_scaling_factor, dtype=np.float32
+            )
+        if calibrated_pose_arrays is not None:
+            npz[f"{name}_calibrated_input_camera_pose"] = calibrated_pose_arrays[
+                view_idx
+            ].astype(np.float32)
         npz[f"{name}_mask"] = mask
         npz[f"{name}_pts3d"] = pts3d_np.astype(np.float32)
         npz[f"{name}_img"] = np.clip(image_np * 255.0, 0.0, 255.0).astype(np.uint8)
@@ -134,6 +414,21 @@ def run_capture(
 
         trans = pose_np[:3, 3]
         cam_translations.append(trans)
+        pose_prior_error = None
+        export_vs_calibrated = None
+        if pose_contract is not None:
+            input_pose_head_reference = (
+                np.linalg.inv(calibrated_pose_arrays[0])
+                @ calibrated_pose_arrays[view_idx]
+            )
+            model_vs_input = pose_delta(input_pose_head_reference, model_pose_np)
+            pose_prior_error = {
+                "model_vs_input_translation_m": model_vs_input["translation_m"],
+                "model_vs_input_rotation_deg": model_vs_input["rotation_deg"],
+            }
+            export_vs_calibrated = pose_delta(
+                calibrated_pose_arrays[view_idx], pose_np
+            )
 
         summary["views"].append(
             {
@@ -143,6 +438,10 @@ def run_capture(
                 "conf_mean": round(c_mean, 4),
                 "conf_median": round(c_med, 4),
                 "camera_translation": [round(float(x), 4) for x in trans],
+                "pose_prior_diagnostic": pose_prior_error,
+                "export_pose_vs_calibrated_input": export_vs_calibrated,
+                "model_metric_scaling_factor": model_metric_scaling_factor,
+                "post_model_similarity_scale": similarity_scale,
                 "depth_min": round(d_min, 4),
                 "depth_median": round(d_med, 4),
                 "depth_max": round(d_max, 4),
@@ -198,8 +497,13 @@ def run_capture(
         "images": images,
         "final_masks": final_masks,
     }
+    timings["reconstruction_postprocess"] = time.perf_counter() - section_started_at
+    _print_timing(
+        "reconstruction_postprocess", timings["reconstruction_postprocess"]
+    )
 
     # GLB: colored point cloud of all 3 views merged
+    section_started_at = time.perf_counter()
     scene_glb = predictions_to_glb(predictions, as_mesh=False)
     glb_path = os.path.join(out_dir, "scene.glb")
     scene_glb.export(glb_path)
@@ -210,15 +514,60 @@ def run_capture(
     pc = trimesh.PointCloud(vertices=all_pts, colors=all_cols)
     ply_path = os.path.join(out_dir, "scene.ply")
     pc.export(ply_path)
+    timings["scene_glb_ply_export"] = time.perf_counter() - section_started_at
+    _print_timing("scene_glb_ply_export", timings["scene_glb_ply_export"])
 
     # NPZ
+    section_started_at = time.perf_counter()
     npz_path = os.path.join(out_dir, "views.npz")
     np.savez_compressed(npz_path, **npz)
+    timings["views_npz_write"] = time.perf_counter() - section_started_at
+    _print_timing("views_npz_write", timings["views_npz_write"])
 
     # summary
+    section_started_at = time.perf_counter()
     summary["num_points"] = int(all_pts.shape[0])
+    copied_provenance = []
+    source_dir = Path(undist_root) / capture
+    for filename in (*PROVENANCE_FILES, "pipeline_preprocess_manifest.json", POSES_FILE):
+        source = source_dir / filename
+        if source.is_file():
+            shutil.copy2(source, Path(out_dir) / filename)
+            copied_provenance.append(filename)
+    summary["copied_provenance_files"] = copied_provenance
+    export_pose_document = {
+        "frame_convention": "opencv_rdf_cam2world",
+        "matrix_direction": "camera_to_world",
+        "world_frame": (
+            pose_contract["world_frame"]
+            if pose_contract is not None
+            else "mapanything_model_reference_arbitrary_scale"
+        ),
+        "translation_unit": (
+            "meter" if pose_contract is not None else "arbitrary_model_scale"
+        ),
+        "pose_export_mode_requested": pose_export_mode,
+        "pose_export_mode_effective": effective_pose_mode,
+        "similarity_scale_correction": scale_metadata,
+        "anchor": summary["pose_anchor"],
+        "poses": {
+            name: export_pose_arrays[index].tolist()
+            for index, name in enumerate(VIEW_NAMES)
+        },
+    }
+    export_pose_filename = "camera_poses_used_for_export.json"
+    with open(Path(out_dir) / export_pose_filename, "w") as f:
+        json.dump(export_pose_document, f, indent=2)
+    summary["export_pose_document"] = export_pose_filename
+    timings["metadata_export"] = time.perf_counter() - section_started_at
+    timings["capture_total"] = time.perf_counter() - capture_started_at
+    summary["timings_seconds"] = {
+        name: _timing_value(seconds) for name, seconds in timings.items()
+    }
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
+    _print_timing("metadata_export", timings["metadata_export"])
+    _print_timing("capture_total", timings["capture_total"])
 
     print(
         f"  saved: {glb_path} ({os.path.getsize(glb_path)} B), "
@@ -230,8 +579,53 @@ def run_capture(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--captures", nargs="*", default=CAPTURES)
+    parser.add_argument("--input-root", default=DEFAULT_UNDIST_ROOT)
+    parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--captures",
+        nargs="*",
+        default=None,
+        help="Capture folder names; omit to auto-discover preprocessed captures",
+    )
+    parser.add_argument(
+        "--allow-missing-poses",
+        action="store_true",
+        help="Allow intentional pose-free, arbitrary-scale inference",
+    )
+    parser.add_argument(
+        "--ignore-poses",
+        action="store_true",
+        help=(
+            "Ignore camera_poses_opencv_cam2world.json even when present; run with "
+            "RGB/intrinsics only and let the model estimate arbitrary-scale poses"
+        ),
+    )
+    parser.add_argument(
+        "--pose-export-mode",
+        choices=POSE_EXPORT_MODES,
+        default=DEFAULT_POSE_EXPORT_MODE,
+        help=(
+            "Final geometry when metric poses are supplied. Default estimates one "
+            "uniform scale from calibrated/model camera baselines, applies it to "
+            "model depth and relative translations, then anchors the calibrated "
+            "head. Other choices preserve the unscaled model geometry or legacy hybrid."
+        ),
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Validate/load/preprocess inputs without loading the model or using CUDA",
+    )
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--minibatch_size", type=int, default=None)
+    parser.add_argument(
+        "--fast-inference",
+        action="store_true",
+        help=(
+            "Run all dense prediction heads together for speed at higher peak VRAM; "
+            "CUDA OOM automatically retries memory-efficient inference"
+        ),
+    )
     parser.add_argument(
         "--max_radius",
         type=float,
@@ -253,28 +647,83 @@ def main():
         help="Export filter: keep points with confidence >= this value",
     )
     args = parser.parse_args()
+    run_started_at = time.perf_counter()
+    captures = resolve_captures(args.input_root, args.captures, preprocessed=True)
     filter_kwargs = dict(
         max_radius=args.max_radius, bbox=args.bbox, min_conf=args.min_conf
     )
 
+    if args.validate_only:
+        print(f"Validating captures: {', '.join(captures)}")
+        for capture in captures:
+            print(f"\n===== {capture} =====")
+            views, contract = load_views(
+                capture,
+                args.input_root,
+                args.allow_missing_poses,
+                ignore_poses=args.ignore_poses,
+            )
+            report = validate_preprocessed_views(views, preprocess_inputs(views))
+            print(
+                json.dumps(
+                    {
+                        "pose_contract": contract,
+                        "pose_export_mode_requested": args.pose_export_mode,
+                        **report,
+                    },
+                    indent=2,
+                )
+            )
+        print("\nValidation complete; model was not loaded.")
+        return
+
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is unavailable. Fix the NVIDIA driver/runtime or run --validate-only."
+        )
     print("Loading MapAnything model...")
-    model = MapAnything.from_pretrained("facebook/map-anything").to("cuda")
+    model_load_started_at = time.perf_counter()
+    model = MapAnything.from_pretrained("facebook/map-anything").to(args.device)
     model.eval()
+    model_load_seconds = time.perf_counter() - model_load_started_at
+    print(f"[TIMING] model_load: {model_load_seconds:.3f} s")
 
     all_summaries = {}
-    for capture in args.captures:
+    for capture in captures:
         try:
             all_summaries[capture] = run_capture(
-                model, capture, minibatch_size=args.minibatch_size, **filter_kwargs
+                model,
+                capture,
+                minibatch_size=args.minibatch_size,
+                undist_root=args.input_root,
+                output_root=args.output_root,
+                allow_missing_poses=args.allow_missing_poses,
+                ignore_poses=args.ignore_poses,
+                pose_export_mode=args.pose_export_mode,
+                memory_efficient_inference=not args.fast_inference,
+                **filter_kwargs,
             )
         except torch.cuda.OutOfMemoryError as e:
-            print(f"  OOM on {capture}: {e}\n  retrying with minibatch_size=1")
+            print(
+                f"  OOM on {capture}: {e}\n"
+                "  retrying with memory-efficient inference and minibatch_size=1"
+            )
             torch.cuda.empty_cache()
             all_summaries[capture] = run_capture(
-                model, capture, minibatch_size=1, **filter_kwargs
+                model,
+                capture,
+                minibatch_size=1,
+                undist_root=args.input_root,
+                output_root=args.output_root,
+                allow_missing_poses=args.allow_missing_poses,
+                ignore_poses=args.ignore_poses,
+                pose_export_mode=args.pose_export_mode,
+                memory_efficient_inference=True,
+                **filter_kwargs,
             )
 
-    print("\nAll done.")
+    total_seconds = time.perf_counter() - run_started_at
+    print(f"\nAll done.\n[TIMING] run_inference_total: {total_seconds:.3f} s")
 
 
 if __name__ == "__main__":

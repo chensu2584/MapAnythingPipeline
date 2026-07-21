@@ -42,9 +42,18 @@ Example:
 import argparse
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 import trimesh
+
+from capture_contract import VIEW_NAMES, resolve_reconstruction_captures
+from gripper_pose import (
+    DEFAULT_G1_URDF,
+    DEFAULT_GRIPPER_URDF,
+    resolve_gripper_poses,
+    write_gripper_poses,
+)
 
 try:
     import open3d as o3d
@@ -52,11 +61,15 @@ except (ImportError, OSError) as e:  # OSError: missing libGL on headless server
     o3d = None
     _O3D_IMPORT_ERROR = e
 
-OUT_ROOT = os.path.expanduser("~/MapAnythingTest/outputs/")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_OUTPUT_ROOT = os.path.expanduser(
+    os.environ.get("G2_OUT_ROOT", str(PROJECT_ROOT / "outputs"))
+)
 
-VIEW_NAMES = ["head", "hand_left", "hand_right"]
-
-CAPTURES = ["g_1_Test_1", "g_1_Test_2", "g_1_Test_3", "g_1_Test_4"]
+GRIPPER_MARKER_COLORS = {
+    "left": [255, 160, 0, 255],
+    "right": [0, 220, 255, 255],
+}
 
 
 def build_filter_mask(pts3d, conf, max_radius=None, bbox=None, min_conf=None):
@@ -83,10 +96,10 @@ def build_filter_mask(pts3d, conf, max_radius=None, bbox=None, min_conf=None):
     return keep
 
 
-def load_points(capture):
+def load_points(capture, output_root=DEFAULT_OUTPUT_ROOT):
     """Merged filtered-input point cloud from views.npz.
     Returns (pts (N,3) f32, cols (N,3) f32 in [0,1], conf (N,) f32 or None)."""
-    npz = np.load(os.path.join(OUT_ROOT, capture, "views.npz"))
+    npz = np.load(os.path.join(output_root, capture, "views.npz"))
     pts_list, col_list, conf_list = [], [], []
     have_conf = all(f"{n}_conf" in npz for n in VIEW_NAMES)
     for name in VIEW_NAMES:
@@ -184,11 +197,49 @@ def voxels_to_glb_mesh(indices, colors, voxel_size, origin):
     return mesh
 
 
-def process_capture(capture, voxel_size, max_radius=None, bbox=None, min_conf=None):
-    out_dir = os.path.join(OUT_ROOT, capture)
+def voxel_scene_with_grippers(voxel_mesh, gripper_poses):
+    """Add tool-center spheres/frames using the same GLB X flip as voxels."""
+    scene = trimesh.Scene()
+    scene.add_geometry(voxel_mesh, geom_name="occupied_voxels")
+    flip_x = trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0])
+    for side in ("left", "right"):
+        pose = np.asarray(
+            gripper_poses["poses"][side]["pose_matrix"], dtype=np.float64
+        )
+        center = trimesh.creation.icosphere(subdivisions=2, radius=0.018)
+        center.apply_translation(pose[:3, 3])
+        center.visual.face_colors = np.tile(
+            np.asarray(GRIPPER_MARKER_COLORS[side], dtype=np.uint8),
+            (len(center.faces), 1),
+        )
+        frame = trimesh.creation.axis(
+            origin_size=0.008,
+            axis_radius=0.08 / 30.0,
+            axis_length=0.08,
+        )
+        frame.apply_transform(pose)
+        center.apply_transform(flip_x)
+        frame.apply_transform(flip_x)
+        scene.add_geometry(center, geom_name=f"gripper_{side}_center")
+        scene.add_geometry(frame, geom_name=f"gripper_{side}_frame")
+    return scene
+
+
+def process_capture(
+    capture,
+    voxel_size,
+    max_radius=None,
+    bbox=None,
+    min_conf=None,
+    show_grippers=False,
+    g1_urdf=DEFAULT_G1_URDF,
+    gripper_urdf=DEFAULT_GRIPPER_URDF,
+    output_root=DEFAULT_OUTPUT_ROOT,
+):
+    out_dir = os.path.join(output_root, capture)
     print(f"\n===== {capture} =====")
 
-    pts, cols, conf = load_points(capture)
+    pts, cols, conf = load_points(capture, output_root)
     n_raw = pts.shape[0]
 
     keep = build_filter_mask(pts, conf, max_radius=max_radius, bbox=bbox, min_conf=min_conf)
@@ -242,12 +293,30 @@ def process_capture(capture, voxel_size, max_radius=None, bbox=None, min_conf=No
 
     mesh = voxels_to_glb_mesh(vox["indices"], vox["colors"], voxel_size, origin)
     glb_path = os.path.join(out_dir, "voxels.glb")
-    mesh.export(glb_path)
+    gripper_poses = None
+    gripper_pose_path = None
+    export_geometry = mesh
+    if show_grippers:
+        gripper_poses = resolve_gripper_poses(
+            out_dir,
+            g1_urdf=g1_urdf,
+            gripper_urdf=gripper_urdf,
+        )
+        gripper_pose_path = os.path.join(out_dir, "gripper_poses_base_link.json")
+        write_gripper_poses(gripper_pose_path, gripper_poses)
+        export_geometry = voxel_scene_with_grippers(mesh, gripper_poses)
+    export_geometry.export(glb_path)
 
     print(
         f"  saved: {npz_path}, {glb_path} ({os.path.getsize(glb_path)} B, "
         f"{len(mesh.faces)} faces)"
     )
+    if gripper_poses is not None:
+        print(
+            "  added gripper centers to voxels.glb: "
+            f"left={np.round(gripper_poses['poses']['left']['position_m'], 6).tolist()}, "
+            f"right={np.round(gripper_poses['poses']['right']['position_m'], 6).tolist()}"
+        )
     return {
         "capture": capture,
         "points_in": int(pts.shape[0]),
@@ -256,6 +325,8 @@ def process_capture(capture, voxel_size, max_radius=None, bbox=None, min_conf=No
         "occupied_voxels": int(n_vox),
         "occupancy_pct": round(occ_pct, 3),
         "origin": [round(float(v), 4) for v in origin],
+        "show_grippers": show_grippers,
+        "gripper_pose_json": gripper_pose_path,
     }
 
 
@@ -263,7 +334,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Sparse occupancy-grid voxelization from views.npz"
     )
-    parser.add_argument("--captures", nargs="*", default=CAPTURES)
+    parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--captures",
+        nargs="*",
+        default=None,
+        help="Capture folder names; omit to auto-discover folders with views.npz",
+    )
     parser.add_argument(
         "--voxel_size",
         type=float,
@@ -290,10 +367,18 @@ def main():
         default=None,
         help="Pre-filter: keep points with confidence >= this value",
     )
+    parser.add_argument(
+        "--show_grippers",
+        action="store_true",
+        help="Add resolved G1 left/right gripper-center markers to voxels.glb",
+    )
+    parser.add_argument("--g1_urdf", default=str(DEFAULT_G1_URDF))
+    parser.add_argument("--gripper_urdf", default=str(DEFAULT_GRIPPER_URDF))
     args = parser.parse_args()
+    captures = resolve_reconstruction_captures(args.output_root, args.captures)
 
     results = []
-    for capture in args.captures:
+    for capture in captures:
         results.append(
             process_capture(
                 capture,
@@ -301,6 +386,10 @@ def main():
                 max_radius=args.max_radius,
                 bbox=args.bbox,
                 min_conf=args.min_conf,
+                show_grippers=args.show_grippers,
+                g1_urdf=args.g1_urdf,
+                gripper_urdf=args.gripper_urdf,
+                output_root=args.output_root,
             )
         )
     print("\n" + json.dumps(results, indent=2))
