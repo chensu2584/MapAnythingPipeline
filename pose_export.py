@@ -1,0 +1,197 @@
+"""Pure-numpy camera-pose selection for MapAnything reconstruction export."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import numpy as np
+
+
+CALIBRATED_INPUT = "calibrated-input"
+MODEL_RELATIVE_HEAD_ANCHORED = "model-relative-head-anchored"
+MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED = (
+    "model-relative-head-anchored-baseline-scaled"
+)
+MODEL_PREDICTION_ARBITRARY_SCALE = "model-prediction-arbitrary-scale"
+POSE_EXPORT_MODES = (
+    MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED,
+    MODEL_RELATIVE_HEAD_ANCHORED,
+    CALIBRATED_INPUT,
+)
+DEFAULT_POSE_EXPORT_MODE = MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED
+
+
+def _pose(value: np.ndarray, label: str) -> np.ndarray:
+    pose = np.asarray(value, dtype=np.float64)
+    if pose.shape != (4, 4):
+        raise ValueError(f"{label} has shape {pose.shape}, expected (4, 4)")
+    if not np.isfinite(pose).all():
+        raise ValueError(f"{label} contains non-finite values")
+    if not np.allclose(pose[3], [0.0, 0.0, 0.0, 1.0], atol=1e-5):
+        raise ValueError(f"{label} has an invalid homogeneous bottom row")
+    return pose
+
+
+def pose_delta(reference: np.ndarray, candidate: np.ndarray) -> dict[str, float]:
+    """Return candidate-vs-reference rigid-pose difference."""
+
+    reference = _pose(reference, "reference pose")
+    candidate = _pose(candidate, "candidate pose")
+    delta = np.linalg.inv(reference) @ candidate
+    cos_angle = np.clip((np.trace(delta[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)
+    return {
+        "translation_m": float(np.linalg.norm(delta[:3, 3])),
+        "rotation_deg": float(np.degrees(np.arccos(cos_angle))),
+    }
+
+
+def align_model_poses_to_calibrated_head(
+    model_poses: Sequence[np.ndarray],
+    calibrated_head_pose: np.ndarray,
+    similarity_scale: float = 1.0,
+) -> tuple[list[np.ndarray], np.ndarray]:
+    """Place model-relative poses in calibrated world, optionally scaling baselines.
+
+    MapAnything returns all model poses in one internally consistent reference
+    frame.  View 0 is the head by the pipeline contract.  A single left-side
+    transform maps that reference frame to the calibrated world.  A common positive
+    similarity scale changes only head-relative translations; rotations and the
+    relative directions remain untouched.  Depth must be multiplied by the same
+    scale by the caller to keep the reconstructed geometry self-consistent.
+    """
+
+    if not model_poses:
+        raise ValueError("At least one model pose is required")
+    checked = [_pose(value, f"model pose {index}") for index, value in enumerate(model_poses)]
+    calibrated_head = _pose(calibrated_head_pose, "calibrated head pose")
+    if not np.isfinite(similarity_scale) or similarity_scale <= 0:
+        raise ValueError("Similarity scale must be finite and positive")
+    model_head_t_world = np.linalg.inv(checked[0])
+    world_t_model_reference = calibrated_head @ np.linalg.inv(checked[0])
+    aligned = []
+    for pose in checked:
+        head_t_camera = model_head_t_world @ pose
+        head_t_camera = head_t_camera.copy()
+        head_t_camera[:3, 3] *= similarity_scale
+        aligned.append(calibrated_head @ head_t_camera)
+    if not np.allclose(aligned[0], calibrated_head, atol=1e-7):
+        raise AssertionError("Head anchoring did not reproduce the calibrated head pose")
+    return aligned, world_t_model_reference
+
+
+def estimate_baseline_similarity_scale(
+    model_poses: Sequence[np.ndarray], calibrated_poses: Sequence[np.ndarray]
+) -> dict:
+    """Fit one scale from all pairwise calibrated/model camera baselines."""
+
+    model = [_pose(value, f"model pose {index}") for index, value in enumerate(model_poses)]
+    calibrated = [
+        _pose(value, f"calibrated pose {index}")
+        for index, value in enumerate(calibrated_poses)
+    ]
+    if len(model) != len(calibrated):
+        raise ValueError("Model and calibrated pose counts differ")
+    if len(model) < 2:
+        raise ValueError("At least two camera poses are required to estimate scale")
+
+    labels = (
+        ("head", "hand_left", "hand_right")
+        if len(model) == 3
+        else tuple(f"view_{index}" for index in range(len(model)))
+    )
+    pairs = []
+    model_baselines = []
+    calibrated_baselines = []
+    for first in range(len(model)):
+        for second in range(first + 1, len(model)):
+            model_baseline = float(
+                np.linalg.norm(model[first][:3, 3] - model[second][:3, 3])
+            )
+            calibrated_baseline = float(
+                np.linalg.norm(
+                    calibrated[first][:3, 3] - calibrated[second][:3, 3]
+                )
+            )
+            if model_baseline <= 1e-6 or calibrated_baseline <= 1e-6:
+                raise ValueError("Cannot estimate scale from a degenerate camera baseline")
+            model_baselines.append(model_baseline)
+            calibrated_baselines.append(calibrated_baseline)
+            pairs.append((labels[first], labels[second]))
+
+    model_vector = np.asarray(model_baselines)
+    calibrated_vector = np.asarray(calibrated_baselines)
+    scale = float(
+        np.dot(model_vector, calibrated_vector) / np.dot(model_vector, model_vector)
+    )
+    if not 0.25 <= scale <= 4.0:
+        raise ValueError(f"Estimated similarity scale {scale:.6g} is implausible")
+    corrected = scale * model_vector
+    ratios = calibrated_vector / model_vector
+    ratio_median = float(np.median(ratios))
+    pairwise = {}
+    for (first, second), model_value, calibrated_value, ratio, corrected_value in zip(
+        pairs, model_vector, calibrated_vector, ratios, corrected
+    ):
+        pairwise[f"{first}__{second}"] = {
+            "model_baseline_before_m": float(model_value),
+            "calibrated_baseline_m": float(calibrated_value),
+            "calibrated_over_model_ratio": float(ratio),
+            "model_baseline_after_m": float(corrected_value),
+            "residual_after_m": float(corrected_value - calibrated_value),
+        }
+    return {
+        "applied": True,
+        "scale": scale,
+        "estimator": "least_squares_all_pairwise_camera_baseline_lengths",
+        "pairwise": pairwise,
+        "baseline_rmse_before_m": float(
+            np.sqrt(np.mean((model_vector - calibrated_vector) ** 2))
+        ),
+        "baseline_rmse_after_m": float(
+            np.sqrt(np.mean((corrected - calibrated_vector) ** 2))
+        ),
+        "pair_ratio_median": ratio_median,
+        "pair_ratio_relative_spread": float(
+            (ratios.max() - ratios.min()) / ratio_median
+        ),
+    }
+
+
+def select_export_poses(
+    model_poses: Sequence[np.ndarray],
+    calibrated_poses: Sequence[np.ndarray] | None,
+    requested_mode: str = DEFAULT_POSE_EXPORT_MODE,
+) -> tuple[list[np.ndarray], str, np.ndarray | None, dict | None]:
+    """Return final poses, effective mode, rigid anchor and scale report."""
+
+    if requested_mode not in POSE_EXPORT_MODES:
+        raise ValueError(
+            f"Unknown pose export mode {requested_mode!r}; expected one of {POSE_EXPORT_MODES}"
+        )
+    checked_model = [
+        _pose(value, f"model pose {index}") for index, value in enumerate(model_poses)
+    ]
+    if calibrated_poses is None:
+        return checked_model, MODEL_PREDICTION_ARBITRARY_SCALE, None, None
+
+    checked_calibrated = [
+        _pose(value, f"calibrated pose {index}")
+        for index, value in enumerate(calibrated_poses)
+    ]
+    if len(checked_calibrated) != len(checked_model):
+        raise ValueError("Model and calibrated pose counts differ")
+    if requested_mode == CALIBRATED_INPUT:
+        return checked_calibrated, CALIBRATED_INPUT, None, None
+    scale_report = None
+    similarity_scale = 1.0
+    if requested_mode == MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED:
+        scale_report = estimate_baseline_similarity_scale(
+            checked_model, checked_calibrated
+        )
+        similarity_scale = scale_report["scale"]
+    aligned, anchor = align_model_poses_to_calibrated_head(
+        checked_model,
+        checked_calibrated[0],
+        similarity_scale=similarity_scale,
+    )
+    return aligned, requested_mode, anchor, scale_report

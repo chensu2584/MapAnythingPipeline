@@ -1,124 +1,273 @@
-# 计划:体素化 + 语义分类对齐(2026-07-11)
+# 计划：面向机器人操作的语义体素地图
 
-> 前置阅读:`PROJECT_LOG.md`。本文档是两个新任务的调研结论与实施计划:
-> ① 点云 → 体素(occupancy grid);② 头部相机跑物体分类/检测,并与点云对齐,服务机器人操作。
+> 初版：2026-07-11
+>
+> 审阅更新：2026-07-20
+>
+> 状态：几何体素 P1 已实现；语义提升、实例融合和操作接口尚未实现。
+>
+> 本文是当前方案的唯一决策基线。`TECH_DETAIL_TASK2.md` 保留早期单帧实现细节，若与本文冲突，以本文为准。
 
-## 0. 核心结论(先回答问题)
+## 1. 目标与边界
 
-**MapAnything 没有任何语义功能,只做几何重建。** 证据(已在代码库核实):
+目标不是只给 GLB/点云染色，而是建立可供规则系统查询的**稀疏语义体素地图**：
 
-- 预测头输出适配器(`configs/model/pred_head/adaptor_config/`)只有:pointmap、ray directions、depth、pose、confidence、mask、scale —— 全是几何量,没有类别/分割头
-- 数据集代码里出现的 "segmentation" 只是训练用的有效像素掩码(non-ambiguous mask),不是语义标签
-- 模型内部虽然用 DINOv2 做图像编码(DINOv2 特征本身含语义信息),但没有暴露任何语义输出接口
+```text
+三路 MapAnything 几何
+        +
+头部 YOLO 类别/实例掩码
+        ↓
+固定坐标系下的 Semantic Voxel Map
+        ↓
+对象实例 / 空间关系 / 碰撞几何 / 操作候选
+        ↓
+抓取、移动物体、拉抽屉等规则操作
+```
 
-因此语义必须由**外部 2D 模型**提供,再"提升"(lift)到 3D。好消息:我们的
-`views.npz` 已经存了 `head_pts3d`(H×W×3,世界坐标,米),即**每个像素都有对应 3D 点**
-—— 2D 掩码 → 3D 点云只是一次数组索引,不需要任何投影计算。这是整个方案的基石。
+地图必须同时回答：
 
-## 1. 任务一:点云体素化(occupancy grid)
+1. 该空间是 `unknown / free / occupied` 中的哪一种；
+2. 被占据体素属于什么类别；
+3. 属于哪个对象实例，而不只是“都是 box”；
+4. 结论来自哪些相机/帧、置信度多少、最后何时看到；
+5. 如何从体素恢复可操作对象的中心、尺寸、朝向、表面和部件。
 
-### 1.1 调研结论
+当前不把语义地图视为安全认证传感器，也不要求一次 MapAnything snapshot 直接提供毫米级抓取位姿。全局地图用于发现目标、规则推理和粗定位；执行抓取/拉抽屉前，用当前相机或深度传感器进行局部在线校正。
 
-智能驾驶里的"小方块"= **占据栅格(occupancy grid)**,固定分辨率的 3D 格子,每格存占据状态(+可选语义)。主流方案对比:
+## 2. 当前事实与审阅结论
 
-| 方案 | 特点 | 适用 |
+### 2.1 已完成
+
+- `voxelize.py` 已能把 `views.npz` 的三路世界坐标点云体素化；默认 2 cm。
+- 当前输出 `voxels.npz` 保存稀疏体素索引、颜色、点数和几何置信度，`labels/label_scores` 只是全零占位。
+- `voxels.glb` 已用于立方体可视化，并通过 numpy/Open3D 占据索引一致性检查。
+- `views.npz` 保存每个视图逐像素对应的 `<view>_pts3d`，所以头部 2D mask 可以直接索引得到同一像素的 3D 世界点，不必再次手写 `K^-1` 反投影。
+
+### 2.2 尚未完成
+
+- 尚未接入实际 YOLO 权重、类别表和实例 mask。
+- 尚无 `detect_objects.py` / `semantic_lift.py`。
+- 尚无多帧语义累积、稳定实例 ID、动态物体更新和对象级 `objects.json`。
+- 当前只是**表面占据体素**，没有沿相机射线雕刻 free space；因此未观测区域必须视为 `unknown`，不能写成背景或自由空间。
+
+### 2.3 本次审阅后确定的七项原则
+
+1. **几何与语义分文件保存。** 不覆盖原始 `voxels.npz`，生成可重算的 `semantic_voxels.npz`。
+2. **固定网格。** 离线预览可沿用点云 tight bbox；跨 capture/在线操作必须显式给定 `frame + origin + voxel_size + dims`，推荐最终使用 `base_link`。
+3. **类别和实例并存。** 每格既有 `semantic_class`，也有 `instance_id`；对象级规则依赖后者。
+4. **累积概率，不做最后一次覆盖。** 多帧观测更新类别/实例票数，保存观测数、来源和时间戳。
+5. **只直接标记可见表面。** YOLO mask 不得把射线后方的体素整列标成目标；手相机未识别部分只能做受约束的几何传播。
+6. **GLB 只是调试产物。** 完整语义、实例和时间信息以 NPZ + JSON 为准。
+7. **全局粗、操作局部细。** 当前 ChArUco 检测显示跨相机典型误差仍是厘米级；2 cm 全局体素合理，5 mm 全局网格只会表达虚假精度。
+
+## 3. 表示设计
+
+### 3.1 网格元数据
+
+`semantic_voxels_metadata.json`：
+
+```json
+{
+  "schema_version": 1,
+  "frame": "base_link",
+  "voxel_size_m": 0.02,
+  "origin_m": [-1.5, -1.5, -0.3],
+  "dims": [150, 150, 120],
+  "classes": ["unknown", "box", "drawer_front", "drawer_handle"],
+  "source_capture": "g1_capture_..."
+}
+```
+
+若当前 capture 的 pose contract 还不能输出 `base_link`，保留它声明的 `world_frame`，不得把任意模型坐标系默认为机器人基座系。
+
+### 3.2 稀疏体素字段
+
+`semantic_voxels.npz` 的目标 schema：
+
+| 字段 | 类型/形状 | 含义 |
 |---|---|---|
-| **numpy/Open3D 固定分辨率栅格** | 实现最简单,~50 万点毫秒级,离线一次成图 | ✅ 当前阶段(离线 capture) |
-| OctoMap / Bonxai | 八叉树多分辨率,log-odds 概率融合,ROS 生态 | 未来在线建图 |
-| Voxblox / **nvblox** | TSDF+ESDF,GPU 加速,常数时间插入,直接给规划器用 | 未来实时操作闭环 |
+| `indices` | `N×3 int32` | 稀疏体素坐标 |
+| `occupancy_state` | `N int8` | `-1 unknown, 0 free, 1 occupied`；P2 初期只写 occupied |
+| `occupancy_log_odds` | `N float32` | 多帧占据概率；P2 可先由几何置信度初始化 |
+| `colors` | `N×3 uint8` | 融合颜色 |
+| `geometry_confidence` | `N float32` | MapAnything 几何置信度聚合 |
+| `semantic_votes` | `N×C float32` | 各类别累计票数；类别少时直接存稠密矩阵 |
+| `semantic_class` | `N int16` | `argmax(semantic_votes)` 的缓存结果 |
+| `semantic_score` | `N float32` | 归一化类别置信度 |
+| `instance_id` | `N int32` | 稳定对象实例，`-1` 表示未分配 |
+| `instance_score` | `N float32` | 该实例归属置信度 |
+| `observation_count` | `N uint16` | 有效观测次数 |
+| `source_view_mask` | `N uint8` | head/left/right 三位来源掩码 |
+| `last_seen_ns` | `N int64` | 在线模式最后观测时间；离线可为 capture 时间 |
 
-当前数据是离线单帧 capture,场景经 `--max_radius 2.0` 过滤后约 3×3×2 m,**不需要**上重型框架。选 2 cm 体素 → 约 150×150×100 = 225 万格,稀疏存储(实际占据 ~几万格),纯 numpy 即可。留出接口,未来切 nvblox 时数据结构可平移。
+对象类别数变大时再把 `semantic_votes` 改为 top-k 稀疏存储；首版不提前复杂化。
 
-### 1.2 设计
+### 3.3 对象级派生结果
 
-新脚本 **`voxelize.py`**(输入 `views.npz`,纯 CPU,可反复调参,风格同 `filter_export.py`):
+体素是权威空间表示，但规则系统不应逐格遍历。由语义类别、实例 ID 和 3D 连通域派生 `objects.json`：
 
-- 体素大小 `--voxel_size`(默认 0.02 m,操作级;可视化可用 0.05)
-- 工作空间 AABB `--bbox`(默认取过滤后点云包围盒)
-- 每个体素聚合:`occupied`、点数、平均颜色、最大 conf、(任务二写入)语义标签+分数
-- 实现:`idx = floor((pts - origin)/voxel_size)` → `np.unique(展平索引)` → 分组聚合
-- 输出:
-  - `voxels.npz` — 稀疏格式:`indices (N×3 int)`、`origin`、`voxel_size`、`colors`、`counts`、`conf`(+ 语义字段)—— 给机器人/下游用
-  - `voxels.glb` — 每个占据体素画立方体(trimesh box 实例化,合并成单 mesh 保证性能)。⚠️ 必须应用与 `predictions_to_glb` 相同的**180° 绕 X 翻转**(见 PROJECT_LOG §4)
-- 复用 `filter_export.py` 的过滤器逻辑(radius/bbox/conf)作为体素化前的预过滤
+```json
+{
+  "frame": "base_link",
+  "objects": [{
+    "instance_id": 3,
+    "class": "box",
+    "confidence": 0.91,
+    "centroid_m": [0.72, -0.18, 0.64],
+    "aabb": {"min": [], "max": []},
+    "obb": {"center": [], "axes": [], "extent": []},
+    "voxel_count": 4821,
+    "last_seen_ns": 0,
+    "affordances": ["graspable", "movable"]
+  }]
+}
+```
 
-### 1.3 进阶(Phase 3,可选)
+`objects.json` 是体素地图的派生缓存，可以随时重建，不能反过来覆盖原始体素证据。
 
-- **自由空间雕刻(free-space carving)**:利用每视图 `_depth_z` + `_camera_pose` 从光心向每个像素射线投射,射线穿过的体素标记为 free(区分 free/occupied/unknown)。规划避障时有用;纯占据图不需要
-- **多 capture 融合**:有了真实外参(全配模式)后,多帧点云在同一机器人坐标系下 log-odds 累积
+## 4. 语义写入与融合
 
-## 2. 任务二:头部相机物体分类 + 点云对齐
+### 4.1 2D 入口
 
-> 逐步技术详解(数据流、每步的原因与陷阱)另见 **`TECH_DETAIL_TASK2.md`**。
+- 优先使用 YOLO 实例分割：输出 `class + score + instance mask`。
+- 若当前模型只有检测框，框不能直接提升到 3D；短期使用 YOLO box 提示 SAM2 得到 mask，纯几何聚类只作为降级方案。
+- YOLO 在其训练域的全分辨率头图上运行；结果按照 `undistort.py` 的 remap 和 MapAnything preprocessing 精确变换到 `<view>_pts3d` 的 H×W 像素域。
+- 每个阶段输出 overlay，先证明 2D mask 与去畸变/缩放后的图像一致，再写 3D。
 
-### 2.1 模型选型(已定:用户自训 YOLO,2026-07-11 更新)
+### 4.2 直接提升到头部表面体素
 
-**分类器采用用户已(大致)训练好的 YOLO 模型**,不再引入 Grounding DINO 等开放词汇方案(原调研结论存档见 git 历史/本节末备注)。这带来两个必须先确认的分支点:
+```python
+valid = instance_mask & head_mask & geometry_confidence_mask
+points_world = head_pts3d[valid]
+voxel_index = floor((points_world - grid_origin) / voxel_size)
+```
 
-**分支 A:检测版(boxes)还是分割版(seg,带掩码)?**
+对类别 `c` 的一次观测，建议票重：
 
-| 情况 | 2D→3D 提升方式 |
+```text
+w = yolo_score × geometry_weight × mask_interior_weight × view_weight
+semantic_votes[voxel, c] += w
+```
+
+- mask 边缘降低权重或腐蚀 1–2 个全分辨率像素，抑制深度边界渗色。
+- 同一像素只写其已重建表面所在体素；没有自由空间 raycast 前，不推断该射线上其他体素。
+- 类别冲突保留完整票数和置信度，不立即删除低票类别。
+
+### 4.3 实例关联
+
+单帧 YOLO 的实例序号不是稳定 ID。跨帧按以下顺序关联：
+
+1. 类别相同；
+2. 3D voxel IoU / OBB IoU；
+3. 质心距离与尺寸一致性；
+4. 必要时加入颜色/图像 embedding；
+5. 达不到门限则新建实例，短时丢失保留旧实例并降低置信度。
+
+动态对象不能永久烙在静态体素地图中。在线阶段需按 `last_seen` 衰减或清除旧实例占据，并区分静态层与动态对象层。
+
+### 4.4 三相机几何补全
+
+首版只让头部 YOLO 决定语义；三相机均可贡献几何。头部直接标记后：
+
+- 落入同一体素的手相机点自然继承该体素语义；
+- 邻域传播必须同时满足空间邻接、颜色/法向相似、没有明显深度断层、属于同一几何连通分量；
+- 桌面与盒子、柜体与抽屉面板的接触区域要阻止无条件 region growing；
+- 每个传播标签保存来源，能区分“YOLO 直接观测”和“几何推断”。
+
+将来若手相机也运行合适的分割模型，则作为独立观测写入同一投票系统，而不是覆盖头部结果。
+
+## 5. 面向具体操作的派生逻辑
+
+### 5.1 移动盒子
+
+1. 取 `class=box, instance_id=k` 的连通体素；
+2. 去除小分量并拟合 AABB/OBB；
+3. 从外表面体素估计可见平面、顶面和候选夹持面；
+4. 生成粗抓取位姿和碰撞盒；
+5. 抓取前以当前头/腕相机建立 5–10 mm 局部地图，重新估计最终抓取位姿。
+
+### 5.2 拉抽屉
+
+YOLO 类别至少拆成 `drawer_front` 与 `drawer_handle`，柜体可另设 `cabinet`：
+
+1. 对 `drawer_front` 体素拟合平面与法向；
+2. 对 `drawer_handle` 实例提取中心、主轴和可夹持区域；
+3. 由面板法向生成预抓取与拉动方向；
+4. 视觉估计只提供初值，实际拉动使用轨迹约束并结合力/力矩或接触检测。
+
+语义标签本身不能表达抽屉关节；后续对象层还需保存 `joint_type=prismatic`、轴向、开合状态和估计行程。
+
+## 6. 分辨率策略
+
+| 地图 | 建议体素 | 用途 |
+|---|---:|---|
+| 全局语义地图 | 2–3 cm | 查找对象、规则推理、粗定位、碰撞包围 |
+| 粗避障地图 | 3–5 cm | 保守障碍占据与膨胀 |
+| 操作局部地图 | 5–10 mm | 抓取、把手定位和接触前校正 |
+
+已有 ChArUco A/B 结果显示：相机坐标深度偏差约 1–4 cm，当前世界同角点典型误差约 3–4 cm。因此首版全局 2 cm 是分辨率上限，不代表 2 cm 绝对定位精度。局部 5–10 mm 地图必须来自执行时的新观测和局部配准。
+
+## 7. 实施阶段与交付物
+
+| 阶段 | 状态 | 工作 | 主要产物 |
+|---|---|---|---|
+| P1 几何体素基线 | **已完成（离线版）** | 三路表面点体素化与 GLB 可视化 | `voxels.npz`, `voxels.glb` |
+| P1.1 操作网格契约 | 待做 | 固定 bbox/origin/frame；schema/version 校验；不再依赖每帧 tight bbox | metadata + 回归测试 |
+| P2 单帧语义提升 | 待做 | YOLO adapter、mask remap、head mask→3D、语义投票 | overlays, masks, `semantic_voxels.npz/.glb` |
+| P2.1 对象派生 | 待做 | 连通域、AABB/OBB、实例 ID、对象导出 | `objects.json`, object debug GLB |
+| P3 多帧融合 | 待做 | 固定 base 网格、多帧累计、ID 关联、过期/动态层 | 持久语义地图与轨迹日志 |
+| P4 操作接口 | 待做 | box 抓取面、drawer front/handle、局部精修接口 | 规则系统查询 API |
+| P5 占据增强 | 远期 | ray carving、free/unknown、TSDF/ESDF、在线后端 | 可供规划器直接查询的地图 |
+
+P2 开始前需要确定：YOLO 框架/版本、权重路径、类别表、det 或 seg、训练图像是否去畸变、输入尺寸和默认阈值。
+
+## 8. 验收门槛
+
+每个阶段必须留下可复现实验，不以“GLB 看起来差不多”为唯一标准。
+
+### P1.1
+
+- 同一世界点在不同 capture 中得到相同 voxel index；
+- metadata 明确 frame、单位、origin、dims、voxel size 和 schema version；
+- 越界点有统计和报警，不静默 clip 到边界格。
+
+### P2
+
+- 保存原图、去畸变图和 MapAnything 输入域三层 mask overlay；
+- 语义 GLB 可按 class 和 instance 两种方式着色；
+- 统计每实例 2D 像素数、有效 3D 点数、占据体素数、被过滤比例和背景泄漏；
+- 在人工选取的盒子/桌面边界样本上单独检查标签纯度。
+
+### P3/P4
+
+- 同一静态对象从不同头部姿态观察时保持实例 ID；
+- 报告对象中心/OBB 跨帧波动，不把体素大小当作精度；
+- 规则层能按 `class + instance_id + confidence + freshness` 查询；
+- 最终抓取或拉动前，必须检查局部观测是否新鲜以及不确定度是否低于任务门限。
+
+## 9. 风险与非目标
+
+| 风险 | 处理 |
 |---|---|
-| YOLO-seg(有掩码) | 最理想,掩码直接进 §2.2 流程,无需其他模型 |
-| YOLO-det(只有框) | 框内像素 ≠ 物体像素(含背景),需二选一:<br>**A1(推荐)**:框作为 prompt 喂给 SAM2 出掩码 —— YOLO 管"是什么",SAM2 管"哪些像素",各司其职,掩码质量最好<br>**A2(零依赖备选)**:纯几何法 —— 取框内全部 `pts3d`,按深度中值/DBSCAN 聚类取最近的主簇作为物体点。无需装 SAM2,但细长/镂空物体和贴近背景的物体会失真 |
+| mask 边缘混入背景 | 边缘降权/腐蚀、3D 聚类、连通域纯度检查 |
+| 三相机仍有厘米级未对齐 | 全局体素不追求虚假高分辨率；局部重观测与配准 |
+| 透明、反光、细把手几何缺失 | 保留 unknown；换视角主动观察；必要时使用 RGB-D/已知模型 |
+| 物体移动后留下旧语义 | 动态层、时间戳、置信度衰减和清除策略 |
+| 只有类别没有对象身份 | 强制保存并维护 `instance_id` |
+| 只看表面点却声称 free space | P5 ray carving 前严格区分 unknown 与 free |
+| 语义正确但位姿不够抓取 | 操作前局部精修；已知物体可增加 6D pose 模块 |
 
-**分支 B:YOLO 训练用的是原始(带畸变)图还是去畸变图?**
+## 10. 当前推荐的最小闭环
 
-对齐要求掩码/框最终落在**去畸变图像域**(与 `head_pts3d` 逐像素对应)。头部相机畸变较小,但不能忽略:
+第一轮不要同时实现 TSDF、在线 ROS 和开放词汇模型。先完成一个可测闭环：
 
-| 情况 | 处理 |
-|---|---|
-| 训练用去畸变图 | 直接在去畸变 PNG 上推理,零转换 |
-| 训练用原始图 | 在原始图上推理(保持训练域,精度最优),然后把结果**用 `undistort.py` 的同一套 remap 映射到去畸变域**:掩码直接 `cv2.remap`(最近邻);框不能只映射四角(直线在畸变下弯曲),应先框→填充掩码→remap。若懒得转换也可直接在去畸变图上推理碰运气 —— 头部相机畸变小,域差可能可接受,但需实测 mAP 不掉 |
+```text
+一个带实例 mask 的头部 YOLO capture
+    → 固定 2 cm 网格
+    → head mask 直接写表面语义票数
+    → class/instance 着色 GLB
+    → 从 box 体素生成 objects.json + OBB
+    → 改变头部姿态再采一帧，检查同一对象的位置和标签一致性
+```
 
-**其余需要用户提供的信息**(P2 开工前):框架与版本(ultralytics YOLOv8/11?还是 darknet 等)、权重文件路径、类别列表、训练输入分辨率、置信度阈值习惯值。
-
-### 2.2 对齐方案(关键设计)
-
-**不需要外参、不需要投影矩阵运算** —— `views.npz` 的 `head_pts3d` 与 `head_img` 逐像素对齐:
-
-1. **YOLO 跑在全分辨率头部图上**(而非 518 缩放图,小物体检测质量更好);推理域按 §2.1 分支 B 决定,若在原始图上推理则先把结果 remap 到去畸变域
-2. 得到掩码(seg 版直接出;det 版走 §2.1 分支 A1/A2),用**最近邻**缩放到 `head_pts3d` 的分辨率(推理时的 518 集合分辨率)
-3. `obj_pts = head_pts3d[mask & valid_mask]` —— 直接得到该物体的世界坐标点云
-4. **清洗**:掩码先腐蚀 1–2 px(防止物体边缘深度不连续处的"渗色",这是最常见的误差源)→ radius 过滤 → DBSCAN 取最大簇(去除掩码泄漏到背景的散点)
-5. 每个物体输出:`label, score, centroid(m), AABB/OBB, 主轴, 点数` → `objects.json`(世界坐标系,head 相机=原点)
-6. **写入任务一的体素栅格**:物体点所在体素记语义标签,冲突时按检测分数加权多数投票 → **语义占据栅格**(即智能驾驶里的 semantic occupancy)
-
-### 2.3 与机器人操作的衔接
-
-- 当前世界系 = head 相机光心系。拿到**头部相机→机器人基座的外参**(正好是全配模式计划要接入的同一份手眼标定)后,一个 4×4 矩阵把 `objects.json` 和体素图变换到 base 系,机械臂可直接用
-- 手腕相机视图同样有 `_pts3d`,同一世界系 → **多视图语义融合免费获得**(左右手看到同一物体,体素级投票消歧),作为可选增强
-- 已知尺寸物体(如标准水杯)的 OBB 尺寸可反过来**验证米制尺度**(呼应 PROJECT_LOG §3.3 的尺度校验)
-
-### 2.4 已知风险
-
-| 风险 | 对策 |
-|---|---|
-| 掩码边缘深度渗色 | 腐蚀掩码 + DBSCAN 最大簇(§2.2 步骤 4) |
-| 透明/反光物体深度差 | MapAnything 固有限制;用 conf 过滤,必要时物体点云取掩码内中值深度重建 |
-| 518 分辨率下小物体 pts3d 稀疏 | 检测在全分辨率做;物体太小则点数阈值报警 |
-| YOLO 训练域 ≠ 推理域(畸变/光照/相机差异) | 按 §2.1 分支 B 保持训练域推理再 remap;先在 4 个 capture 上做定性验收(overlay PNG 人工检查) |
-| "大致训练好" —— 精度未定量 | P2 第一步就是在真实 capture 上跑通并出 overlay 图评估;漏检/误检严重则反馈重训,不阻塞管线开发(管线对权重文件是热插拔的) |
-| 闭集类别:操作对象不在训练类别里就不可见 | 属于模型能力边界,新物体需回炉加数据重训;若未来需要临时识别新物体,可再补开放词汇方案(原调研:Grounding DINO + SAM2)作旁路 |
-
-## 3. 实施顺序
-
-| 阶段 | 内容 | 依赖 |
-|---|---|---|
-| **P0 环境** | `pip install open3d` + YOLO 运行时(ultralytics 系则 `pip install ultralytics`,按用户框架定)+ 仅当走分支 A1 时装 SAM2;⚠️ 装前 `pip check`,防止重蹈 hydra 冲突覆辙(PROJECT_LOG §5);全部装入现有 `mapanything` env,冲突则单开 env。另需用户提供 YOLO 权重文件与类别表 | 无 |
-| **P1 体素化** | `voxelize.py`:几何占据栅格 + GLB 可视化,4 个 capture 全跑 | P0 |
-| **P2 语义** | `detect_objects.py`(检测+掩码,存 overlay PNG + masks.npz)→ `semantic_lift.py`(2D→3D 提升、清洗、objects.json、写语义进体素) | P0, P1 |
-| **P3 整合** | 接入外参+深度全配模式(原计划)后:base 系输出、多视图语义融合、自由空间雕刻、多帧融合 | 外参/深度数据到位 |
-| **P4 实时化**(远期) | 自训 YOLO 本身已具备实时能力,主要工作在建图侧(nvblox 增量语义占据图)| 机器人侧需求明确后 |
-
-P1、P2 与"外参+深度接入"完全解耦(都只消费 `views.npz` 和去畸变图),可以先做,不用等标定数据。
-
-## 4. 参考来源
-
-- [Grounding DINO (IDEA-Research)](https://github.com/idea-research/groundingdino) — 零样本开放词汇检测,COCO zero-shot 52.5 AP
-- [DINO-X: Unified Open-World Detection](https://arxiv.org/html/2411.14347v1)
-- [Grounded SAM 对比 (Roboflow)](https://playground.roboflow.com/models/idea-research/grounded-sam)
-- [Semantic OctoMap 分割方法对比 (MDPI 2025)](https://www.mdpi.com/2076-3417/15/13/7285) — 语义体素:每格存类别+置信度+占据概率
-- [KRVF: 边缘移动操作的语义体素世界表示 (2026)](https://arxiv.org/pdf/2606.26321)
-- [OctoMap vs Voxel Grid (Robotics SE)](https://answers.ros.org/question/186783/difference-between-octomap-and-voxel-grid/)
-- [OmniMap: 光学+几何+语义统一建图框架](https://arxiv.org/pdf/2509.07500)
+该闭环通过后，再按 P3 增加多帧实例融合，最后接入抓取与抽屉规则。

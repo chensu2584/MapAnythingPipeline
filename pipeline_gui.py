@@ -1,0 +1,721 @@
+#!/usr/bin/env python3
+"""Tk GUI for running selected MapAnythingPipeline stages in order."""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+import queue
+import shlex
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Iterable
+
+import tkinter as tk
+import tkinter.font as tkfont
+from tkinter import filedialog, messagebox, ttk
+
+from pose_export import (
+    CALIBRATED_INPUT,
+    DEFAULT_POSE_EXPORT_MODE,
+    MODEL_RELATIVE_HEAD_ANCHORED,
+    MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED,
+    POSE_EXPORT_MODES,
+)
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+STAGES = ("undistort", "run_inference", "filter_export", "voxelize")
+RAW_REQUIRED_FILES = {
+    "head.png",
+    "hand_left.png",
+    "hand_right.png",
+    "intrinsic_head_front_rgb.json",
+    "intrinsic_hand_left_rgb.json",
+    "intrinsic_hand_right_rgb.json",
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class PipelineConfig:
+    data_root: Path
+    output_root: Path
+    captures: tuple[str, ...]
+    stages: tuple[str, ...]
+    use_metric_poses: bool = True
+    pose_export_mode: str = DEFAULT_POSE_EXPORT_MODE
+    max_radius: float | None = None
+    voxel_size: float = 0.02
+    device: str = "cuda"
+    show_scene_markers: bool = True
+    show_gripper_markers: bool = True
+    export_view_colored_glb: bool = True
+    export_per_camera_k_ab_glb: bool = False
+    reuse_preprocessed: bool = True
+    fast_inference: bool = False
+
+
+def format_duration(seconds: float) -> str:
+    """Format a monotonic elapsed duration for GUI status and logs."""
+
+    total_seconds = max(int(float(seconds)), 0)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def discover_captures(data_root: Path) -> list[str]:
+    """Find raw capture folders without importing heavy pipeline packages."""
+
+    root = data_root.expanduser()
+    if not root.is_dir():
+        return []
+    return sorted(
+        child.name
+        for child in root.iterdir()
+        if child.is_dir()
+        and all((child / filename).is_file() for filename in RAW_REQUIRED_FILES)
+    )
+
+
+def _append_captures(command: list[str], captures: Iterable[str]) -> None:
+    names = tuple(captures)
+    if names:
+        command.extend(("--captures", *names))
+
+
+def build_pipeline_commands(
+    config: PipelineConfig,
+    *,
+    python_executable: str | Path = sys.executable,
+    script_dir: Path = SCRIPT_DIR,
+) -> list[tuple[str, list[str]]]:
+    """Build argv-only commands; subprocesses never use a shell."""
+
+    unknown = set(config.stages) - set(STAGES)
+    if unknown:
+        raise ValueError(f"Unknown pipeline stages: {sorted(unknown)}")
+    if config.voxel_size <= 0:
+        raise ValueError("Voxel size must be positive")
+    if config.max_radius is not None and config.max_radius <= 0:
+        raise ValueError("Max radius must be positive when supplied")
+    if config.pose_export_mode not in POSE_EXPORT_MODES:
+        raise ValueError(f"Unknown pose export mode: {config.pose_export_mode}")
+
+    py = str(python_executable)
+    data_root = str(config.data_root.expanduser().resolve())
+    output_root = str(config.output_root.expanduser().resolve())
+    undistorted_root = str((config.output_root.expanduser().resolve() / "undistorted"))
+    result: list[tuple[str, list[str]]] = []
+
+    if "undistort" in config.stages:
+        command = [
+            py,
+            "-u",
+            str(script_dir / "undistort.py"),
+            "--data-root",
+            data_root,
+            "--output-root",
+            output_root,
+        ]
+        _append_captures(command, config.captures)
+        if not config.use_metric_poses:
+            command.append("--ignore-poses")
+        if config.reuse_preprocessed:
+            command.append("--reuse-existing")
+        result.append(("undistort", command))
+
+    if "run_inference" in config.stages:
+        command = [
+            py,
+            "-u",
+            str(script_dir / "run_inference.py"),
+            "--input-root",
+            undistorted_root,
+            "--output-root",
+            output_root,
+            "--device",
+            config.device,
+        ]
+        _append_captures(command, config.captures)
+        if not config.use_metric_poses:
+            command.append("--ignore-poses")
+        else:
+            command.extend(("--pose-export-mode", config.pose_export_mode))
+        if config.max_radius is not None and config.use_metric_poses:
+            command.extend(("--max_radius", str(config.max_radius)))
+        if config.fast_inference:
+            command.append("--fast-inference")
+        result.append(("run_inference", command))
+
+    if "filter_export" in config.stages:
+        command = [
+            py,
+            "-u",
+            str(script_dir / "filter_export.py"),
+            "--output-root",
+            output_root,
+        ]
+        _append_captures(command, config.captures)
+        if config.max_radius is not None:
+            command.extend(("--max_radius", str(config.max_radius)))
+        if config.show_scene_markers:
+            command.append("--show_cameras")
+        if config.show_gripper_markers:
+            command.append("--show_grippers")
+        if config.export_view_colored_glb:
+            command.append("--color_by_view")
+        if config.export_per_camera_k_ab_glb:
+            command.append("--per_camera_k_ab")
+        result.append(("filter_export", command))
+
+    if "voxelize" in config.stages:
+        command = [
+            py,
+            "-u",
+            str(script_dir / "voxelize.py"),
+            "--output-root",
+            output_root,
+            "--voxel_size",
+            str(config.voxel_size),
+        ]
+        _append_captures(command, config.captures)
+        if config.max_radius is not None:
+            command.extend(("--max_radius", str(config.max_radius)))
+        if config.show_gripper_markers:
+            command.append("--show_grippers")
+        result.append(("voxelize", command))
+
+    return result
+
+
+class PipelineGui:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("MapAnything Pipeline")
+        self.root.geometry("1360x920")
+        self.root.minsize(1100, 760)
+        self._configure_style()
+
+        project_root = SCRIPT_DIR.parent
+        self.data_root_var = tk.StringVar(value=str(project_root / "TestData"))
+        self.output_root_var = tk.StringVar(value=str(project_root / "outputs"))
+        self.use_poses_var = tk.BooleanVar(value=True)
+        self.pose_export_mode_var = tk.StringVar(value=DEFAULT_POSE_EXPORT_MODE)
+        self.pose_mode_var = tk.StringVar()
+        self.max_radius_var = tk.StringVar(value="")
+        self.voxel_size_var = tk.StringVar(value="0.02")
+        self.device_var = tk.StringVar(value="cuda")
+        self.show_scene_markers_var = tk.BooleanVar(value=True)
+        self.show_gripper_markers_var = tk.BooleanVar(value=True)
+        self.export_view_colored_glb_var = tk.BooleanVar(value=True)
+        self.export_per_camera_k_ab_glb_var = tk.BooleanVar(value=False)
+        self.reuse_preprocessed_var = tk.BooleanVar(value=True)
+        self.fast_inference_var = tk.BooleanVar(value=False)
+        self.status_var = tk.StringVar(value="Ready")
+        self.elapsed_var = tk.StringVar(value="Elapsed: --:--:--")
+        self.stage_vars = {
+            name: tk.BooleanVar(value=True) for name in STAGES
+        }
+
+        self.events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.worker: threading.Thread | None = None
+        self.process: subprocess.Popen[str] | None = None
+        self.stop_requested = False
+        self.capture_names: list[str] = []
+        self.run_started_at: float | None = None
+        self.stage_started_at: float | None = None
+        self.active_stage: str | None = None
+
+        self._build_ui()
+        self._update_pose_mode_text()
+        self.refresh_captures()
+        self.root.after(80, self._poll_events)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _configure_style(self) -> None:
+        """Use explicit large fonts for both ttk and classic Tk widgets."""
+
+        self.root.tk.call("tk", "scaling", 1.45)
+        available = set(tkfont.families(self.root))
+        family = next(
+            (
+                name
+                for name in (
+                    "Noto Sans CJK SC",
+                    "Source Han Sans SC",
+                    "WenQuanYi Micro Hei",
+                    "DejaVu Sans",
+                )
+                if name in available
+            ),
+            str(tkfont.nametofont("TkDefaultFont").actual("family")),
+        )
+        mono_family = "DejaVu Sans Mono" if "DejaVu Sans Mono" in available else family
+        self.ui_font = (family, 16)
+        self.heading_font = (family, 17, "bold")
+        self.log_font = (mono_family, 14)
+
+        for font_name in (
+            "TkDefaultFont",
+            "TkTextFont",
+            "TkMenuFont",
+            "TkHeadingFont",
+            "TkCaptionFont",
+            "TkSmallCaptionFont",
+            "TkIconFont",
+            "TkTooltipFont",
+        ):
+            try:
+                named_font = tkfont.nametofont(font_name)
+                named_font.configure(family=family, size=16)
+            except tk.TclError:
+                pass
+        self.root.option_add("*Font", self.ui_font)
+
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure(".", font=self.ui_font)
+        style.configure("TLabelframe.Label", font=self.heading_font)
+        style.configure("TButton", font=self.ui_font, padding=(14, 10))
+        style.configure("TCheckbutton", font=self.ui_font, padding=(5, 5))
+        style.configure("TEntry", font=self.ui_font, padding=(6, 7))
+        style.configure("TCombobox", font=self.ui_font, padding=(6, 7))
+
+    def _build_ui(self) -> None:
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(3, weight=1)
+
+        folders = ttk.LabelFrame(self.root, text="Folders", padding=12)
+        folders.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 8))
+        folders.columnconfigure(1, weight=1)
+        ttk.Label(folders, text="TestData folder").grid(row=0, column=0, sticky="w")
+        ttk.Entry(folders, textvariable=self.data_root_var).grid(
+            row=0, column=1, sticky="ew", padx=8
+        )
+        ttk.Button(folders, text="Browse…", command=self.choose_data_root).grid(
+            row=0, column=2
+        )
+        ttk.Label(folders, text="Output folder").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(folders, textvariable=self.output_root_var).grid(
+            row=1, column=1, sticky="ew", padx=8, pady=(8, 0)
+        )
+        ttk.Button(folders, text="Browse…", command=self.choose_output_root).grid(
+            row=1, column=2, pady=(8, 0)
+        )
+
+        middle = ttk.Frame(self.root)
+        middle.grid(row=1, column=0, sticky="nsew", padx=14, pady=8)
+        middle.columnconfigure(0, weight=1)
+        middle.columnconfigure(1, weight=1)
+        middle.rowconfigure(0, weight=1)
+
+        captures_frame = ttk.LabelFrame(middle, text="Captures", padding=10)
+        captures_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        captures_frame.columnconfigure(0, weight=1)
+        captures_frame.rowconfigure(0, weight=1)
+        self.capture_list = tk.Listbox(
+            captures_frame,
+            selectmode=tk.EXTENDED,
+            exportselection=False,
+            height=10,
+            font=self.ui_font,
+            activestyle="none",
+        )
+        capture_scroll = ttk.Scrollbar(
+            captures_frame, orient="vertical", command=self.capture_list.yview
+        )
+        self.capture_list.configure(yscrollcommand=capture_scroll.set)
+        self.capture_list.grid(row=0, column=0, sticky="nsew")
+        capture_scroll.grid(row=0, column=1, sticky="ns")
+        capture_buttons = ttk.Frame(captures_frame)
+        capture_buttons.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for column in range(3):
+            capture_buttons.columnconfigure(column, weight=1)
+        ttk.Button(capture_buttons, text="Refresh", command=self.refresh_captures).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(capture_buttons, text="Select all", command=self.select_all_captures).grid(
+            row=0, column=1, sticky="ew", padx=4
+        )
+        ttk.Button(capture_buttons, text="Clear", command=lambda: self.capture_list.selection_clear(0, tk.END)).grid(
+            row=0, column=2, sticky="ew", padx=(4, 0)
+        )
+
+        settings = ttk.LabelFrame(middle, text="Pipeline", padding=12)
+        settings.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        settings.columnconfigure(0, weight=1)
+        ttk.Label(settings, text="Steps run in this fixed order:").grid(
+            row=0, column=0, sticky="w"
+        )
+        labels = {
+            "undistort": "1. Undistort",
+            "run_inference": "2. Run inference",
+            "filter_export": "3. Filter / export",
+            "voxelize": "4. Voxelize",
+        }
+        for row, name in enumerate(STAGES, start=1):
+            ttk.Checkbutton(settings, text=labels[name], variable=self.stage_vars[name]).grid(
+                row=row, column=0, sticky="w", pady=2
+            )
+        ttk.Separator(settings).grid(row=5, column=0, sticky="ew", pady=8)
+        ttk.Checkbutton(
+            settings,
+            text="Use calibrated camera extrinsics as model input",
+            variable=self.use_poses_var,
+            command=self._update_pose_mode_text,
+        ).grid(row=6, column=0, sticky="w")
+        pose_selector = ttk.Frame(settings)
+        pose_selector.grid(row=7, column=0, sticky="ew", pady=(6, 0))
+        pose_selector.columnconfigure(1, weight=1)
+        ttk.Label(pose_selector, text="Output geometry").grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        self.pose_export_combo = ttk.Combobox(
+            pose_selector,
+            textvariable=self.pose_export_mode_var,
+            values=POSE_EXPORT_MODES,
+            state="readonly",
+            width=34,
+        )
+        self.pose_export_combo.grid(row=0, column=1, sticky="ew")
+        self.pose_export_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._update_pose_mode_text()
+        )
+        ttk.Label(
+            settings, textvariable=self.pose_mode_var, wraplength=520, foreground="#7c2d12"
+        ).grid(row=8, column=0, sticky="ew", pady=(4, 10))
+
+        options = ttk.Frame(settings)
+        options.grid(row=9, column=0, sticky="ew")
+        options.columnconfigure(1, weight=1)
+        ttk.Label(options, text="Max radius (blank = none)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(options, textvariable=self.max_radius_var, width=10).grid(
+            row=0, column=1, sticky="w", padx=8
+        )
+        ttk.Label(options, text="Voxel size").grid(row=1, column=0, sticky="w", pady=(7, 0))
+        ttk.Entry(options, textvariable=self.voxel_size_var, width=10).grid(
+            row=1, column=1, sticky="w", padx=8, pady=(7, 0)
+        )
+        ttk.Label(options, text="Inference device").grid(row=2, column=0, sticky="w", pady=(7, 0))
+        ttk.Combobox(
+            options,
+            textvariable=self.device_var,
+            values=("cuda", "cuda:0", "cpu"),
+            width=10,
+        ).grid(row=2, column=1, sticky="w", padx=8, pady=(7, 0))
+        ttk.Checkbutton(
+            options,
+            text="Show small cameras + world origin in GLB",
+            variable=self.show_scene_markers_var,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(9, 0))
+        ttk.Checkbutton(
+            options,
+            text="Show G1 gripper centers in GLB (left orange, right cyan)",
+            variable=self.show_gripper_markers_var,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(
+            options,
+            text="Export extra red/green/blue view GLB",
+            variable=self.export_view_colored_glb_var,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(
+            options,
+            text="Experimental per-camera K A/B GLBs",
+            variable=self.export_per_camera_k_ab_glb_var,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(
+            options,
+            text="Reuse unchanged undistorted inputs",
+            variable=self.reuse_preprocessed_var,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(
+            options,
+            text="Fast inference dense head (more VRAM; OOM falls back safely)",
+            variable=self.fast_inference_var,
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(7, 0))
+
+        actions = ttk.Frame(self.root)
+        actions.grid(row=2, column=0, sticky="ew", padx=14, pady=8)
+        actions.columnconfigure(0, weight=1)
+        self.run_button = ttk.Button(actions, text="Run selected pipeline", command=self.start)
+        self.run_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.stop_button = ttk.Button(actions, text="Stop", command=self.stop, state="disabled")
+        self.stop_button.grid(row=0, column=1, padx=(6, 0))
+        ttk.Label(actions, textvariable=self.status_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(actions, textvariable=self.elapsed_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(4, 0)
+        )
+
+        log_frame = ttk.LabelFrame(self.root, text="Live log", padding=8)
+        log_frame.grid(row=3, column=0, sticky="nsew", padx=14, pady=(8, 14))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.log = tk.Text(
+            log_frame,
+            wrap="word",
+            state="disabled",
+            bg="#101216",
+            fg="#e5e7eb",
+            insertbackground="#e5e7eb",
+            font=self.log_font,
+            padx=10,
+            pady=10,
+        )
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
+        self.log.configure(yscrollcommand=log_scroll.set)
+        self.log.grid(row=0, column=0, sticky="nsew")
+        log_scroll.grid(row=0, column=1, sticky="ns")
+
+    def choose_data_root(self) -> None:
+        selected = filedialog.askdirectory(
+            title="Choose TestData folder", initialdir=self.data_root_var.get(), parent=self.root
+        )
+        if selected:
+            self.data_root_var.set(selected)
+            self.refresh_captures()
+
+    def choose_output_root(self) -> None:
+        selected = filedialog.askdirectory(
+            title="Choose output folder", initialdir=self.output_root_var.get(), parent=self.root
+        )
+        if selected:
+            self.output_root_var.set(selected)
+
+    def refresh_captures(self) -> None:
+        self.capture_names = discover_captures(Path(self.data_root_var.get()))
+        self.capture_list.delete(0, tk.END)
+        for name in self.capture_names:
+            self.capture_list.insert(tk.END, name)
+        self.select_all_captures()
+        self.status_var.set(f"Found {len(self.capture_names)} compatible capture(s)")
+
+    def select_all_captures(self) -> None:
+        if self.capture_names:
+            self.capture_list.selection_set(0, tk.END)
+
+    def _update_pose_mode_text(self) -> None:
+        if self.use_poses_var.get():
+            self.pose_export_combo.configure(state="readonly")
+            if (
+                self.pose_export_mode_var.get()
+                == MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED
+            ):
+                self.pose_mode_var.set(
+                    "Recommended: fit one scale from the three calibrated/model camera "
+                    "baselines, scale model depth and relative translations together, "
+                    "then anchor the calibrated head."
+                )
+            elif self.pose_export_mode_var.get() == MODEL_RELATIVE_HEAD_ANCHORED:
+                self.pose_mode_var.set(
+                    "Unscaled diagnostic: preserve MapAnything geometry and rigidly anchor "
+                    "the head; known captures can remain about 11% too large."
+                )
+            else:
+                self.pose_mode_var.set(
+                    "Legacy diagnostic: model depth is reprojected with calibrated poses. "
+                    "This hybrid caused the confirmed 170603/170700 separation."
+                )
+        else:
+            self.pose_export_combo.configure(state="disabled")
+            self.pose_mode_var.set(
+                "RGB-only mode: existing pose files are explicitly ignored; model pose and scale are arbitrary."
+            )
+
+    def _read_config(self) -> PipelineConfig:
+        data_root = Path(self.data_root_var.get()).expanduser()
+        output_root = Path(self.output_root_var.get()).expanduser()
+        if not data_root.is_dir():
+            raise ValueError(f"TestData folder does not exist: {data_root}")
+        output_root.mkdir(parents=True, exist_ok=True)
+        selected = tuple(self.capture_names[i] for i in self.capture_list.curselection())
+        if not selected:
+            raise ValueError("Select at least one compatible capture")
+        stages = tuple(name for name in STAGES if self.stage_vars[name].get())
+        if not stages:
+            raise ValueError("Select at least one pipeline step")
+        radius_text = self.max_radius_var.get().strip()
+        max_radius = float(radius_text) if radius_text else None
+        voxel_size = float(self.voxel_size_var.get())
+        device = self.device_var.get().strip()
+        if not device:
+            raise ValueError("Inference device cannot be empty")
+        return PipelineConfig(
+            data_root=data_root,
+            output_root=output_root,
+            captures=selected,
+            stages=stages,
+            use_metric_poses=self.use_poses_var.get(),
+            pose_export_mode=self.pose_export_mode_var.get(),
+            max_radius=max_radius,
+            voxel_size=voxel_size,
+            device=device,
+            show_scene_markers=self.show_scene_markers_var.get(),
+            show_gripper_markers=self.show_gripper_markers_var.get(),
+            export_view_colored_glb=self.export_view_colored_glb_var.get(),
+            export_per_camera_k_ab_glb=(
+                self.export_per_camera_k_ab_glb_var.get()
+            ),
+            reuse_preprocessed=self.reuse_preprocessed_var.get(),
+            fast_inference=self.fast_inference_var.get(),
+        )
+
+    def start(self) -> None:
+        if self.worker is not None and self.worker.is_alive():
+            return
+        try:
+            config = self._read_config()
+            commands = build_pipeline_commands(config)
+        except (OSError, TypeError, ValueError) as exc:
+            messagebox.showerror("Invalid pipeline configuration", str(exc), parent=self.root)
+            return
+        self.stop_requested = False
+        self.run_started_at = time.perf_counter()
+        self.stage_started_at = None
+        self.active_stage = None
+        self.run_button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
+        self.status_var.set("Running…")
+        self._append_log("\n=== New pipeline run ===\n")
+        self.worker = threading.Thread(
+            target=self._run_commands, args=(commands,), name="mapanything-pipeline", daemon=True
+        )
+        self.worker.start()
+
+    def _run_commands(self, commands: list[tuple[str, list[str]]]) -> None:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        pipeline_started_at = time.perf_counter()
+        try:
+            for stage, command in commands:
+                if self.stop_requested:
+                    raise InterruptedError("Stopped before next stage")
+                stage_started_at = time.perf_counter()
+                self.events.put(("stage", (stage, stage_started_at)))
+                self.events.put(("log", "$ " + shlex.join(command) + "\n"))
+                self.process = subprocess.Popen(
+                    command,
+                    cwd=SCRIPT_DIR,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env=env,
+                )
+                assert self.process.stdout is not None
+                for line in self.process.stdout:
+                    self.events.put(("log", line))
+                return_code = self.process.wait()
+                self.process = None
+                if self.stop_requested:
+                    raise InterruptedError(f"Stopped during {stage}")
+                if return_code != 0:
+                    raise RuntimeError(f"{stage} failed with exit code {return_code}")
+                self.events.put(
+                    ("stage_done", (stage, time.perf_counter() - stage_started_at))
+                )
+            self.events.put(("done", time.perf_counter() - pipeline_started_at))
+        except Exception as exc:
+            self.events.put(
+                ("failed", (str(exc), time.perf_counter() - pipeline_started_at))
+            )
+        finally:
+            self.process = None
+
+    def stop(self) -> None:
+        self.stop_requested = True
+        process = self.process
+        if process is not None and process.poll() is None:
+            process.terminate()
+        self.status_var.set("Stopping…")
+
+    def _poll_events(self) -> None:
+        try:
+            while True:
+                kind, payload = self.events.get_nowait()
+                if kind == "log":
+                    self._append_log(str(payload))
+                elif kind == "stage":
+                    stage, started_at = payload
+                    self.active_stage = str(stage)
+                    self.stage_started_at = float(started_at)
+                    self.status_var.set(f"Running: {stage}")
+                elif kind == "stage_done":
+                    stage, elapsed = payload
+                    self._append_log(
+                        f"\n[TIMING] {stage}: {format_duration(float(elapsed))} "
+                        f"({float(elapsed):.3f} s)\n"
+                    )
+                elif kind == "done":
+                    total = float(payload)
+                    self.status_var.set(
+                        f"Pipeline completed successfully in {format_duration(total)}"
+                    )
+                    self.elapsed_var.set(
+                        f"Total: {format_duration(total)} ({total:.3f} s)"
+                    )
+                    self.run_started_at = None
+                    self.stage_started_at = None
+                    self.active_stage = None
+                    self.run_button.configure(state="normal")
+                    self.stop_button.configure(state="disabled")
+                elif kind == "failed":
+                    message, total = payload
+                    self.status_var.set(f"Pipeline stopped/failed: {message}")
+                    self.elapsed_var.set(
+                        f"Stopped after: {format_duration(float(total))} "
+                        f"({float(total):.3f} s)"
+                    )
+                    self._append_log(f"\nERROR: {message}\n")
+                    self.run_started_at = None
+                    self.stage_started_at = None
+                    self.active_stage = None
+                    self.run_button.configure(state="normal")
+                    self.stop_button.configure(state="disabled")
+        except queue.Empty:
+            pass
+        self._refresh_elapsed_display()
+        self.root.after(80, self._poll_events)
+
+    def _refresh_elapsed_display(self) -> None:
+        if self.run_started_at is None:
+            return
+        now = time.perf_counter()
+        total = now - self.run_started_at
+        if self.active_stage is not None and self.stage_started_at is not None:
+            stage_elapsed = now - self.stage_started_at
+            self.elapsed_var.set(
+                f"{self.active_stage}: {format_duration(stage_elapsed)} | "
+                f"pipeline total: {format_duration(total)}"
+            )
+        else:
+            self.elapsed_var.set(f"Pipeline total: {format_duration(total)}")
+
+    def _append_log(self, text: str) -> None:
+        self.log.configure(state="normal")
+        self.log.insert(tk.END, text)
+        self.log.see(tk.END)
+        self.log.configure(state="disabled")
+
+    def on_close(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            if not messagebox.askyesno(
+                "Pipeline is running", "Stop the active process and close?", parent=self.root
+            ):
+                return
+            self.stop()
+        self.root.destroy()
+
+
+def main() -> None:
+    root = tk.Tk()
+    PipelineGui(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

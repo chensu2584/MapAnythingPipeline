@@ -1,6 +1,50 @@
 # G2 机器人相机 MapAnything 三维重建 — 工作日志与迁移指南
 
-> 最后更新：2026-07-15。用于未来 resume 工作或迁移到其他机器时快速上手。
+> 最后更新：2026-07-21。用于未来 resume 工作或迁移到其他机器时快速上手。
+
+## 2026-07-21：Inference GUI 计时与保守加速
+
+- Pipeline GUI 增加活动阶段和整条 pipeline 的实时计时；每个完成阶段在日志中记录秒数。
+- `run_inference.py` 增加模型加载、输入读取、preprocess、GPU inference、重建后处理、
+  GLB/PLY、NPZ 和单 capture 总耗时，并将 capture 分项写入 `summary.json`。
+- GUI 默认复用内容哈希完全一致且输出完整的 undistort 结果；旧 manifest 首次重算。
+- 新增显式 fast dense-head 模式，用更多峰值显存换速度；CUDA OOM 自动退回
+  memory-efficient + minibatch 1。没有移除 pose/K 校验或 edge mask。
+- 当前执行环境无法连接 NVIDIA driver，因此只确认了本地源码中的速度/显存语义，没有声称
+  未测得的 GPU 加速比例；正式比例以后由新增计时在同一 capture 上 A/B 得到。
+
+## 2026-07-20：语义体素方案审阅
+
+- 审阅并重写 `PLAN_SEMANTIC_VOXEL.md`，将目标从“单次 YOLO 标签写入占据格”明确为
+  面向机器人操作的稀疏语义体素地图。
+- 当前 `voxelize.py` 只实现 P1 表面占据体素；`labels/label_scores` 仍是占位，语义提升、
+  稳定实例 ID、多帧融合和操作接口均未实现。
+- 确定语义图需要固定 `frame/origin/voxel_size/dims`，区分 unknown/free/occupied，并同时
+  保存类别票数、实例 ID、观测来源、次数与时间戳；GLB 只作调试，NPZ/JSON 是数据接口。
+- 头部 YOLO 实例 mask 直接索引 `head_pts3d` 写入可见表面；三相机只先补几何，未直接
+  观察部分必须受颜色/法向/连通性约束传播，不能沿检测射线或最近邻无条件扩散。
+- 结合当前 ChArUco 结果，采用 2–3 cm 全局语义体素；5–10 mm 只用于动作前实时局部精修，
+  不把 voxel size 误当作绝对定位精度。
+- 最小闭环定为：单 capture YOLO-Seg → 固定 2 cm 网格 → class/instance 语义 GLB →
+  `objects.json`/box OBB → 改变头部姿态复测一致性。
+
+## 2026-07-20：G1 自洽 pose、逐采集尺度与剩余误差边界
+
+- 旧 metric 导出的 `model depth/K + forced calibrated pose` hybrid 会令部分 capture 分离；默认
+  已改为保留 MapAnything 三路相对 pose，再以 calibrated head 锚定到 `base_link`。
+- 用户实体测量确认部分重建约大 11%；固定 scale 不可用，因为 calibrated/model baseline 给出
+  `170323/170536≈0.9857/0.9832`、`170603/170700≈0.8980/0.8938`。
+- 当前默认 `model-relative-head-anchored-baseline-scaled` 对每个 capture 用三条 camera baseline
+  最小二乘求 `s`，同时执行 `depth_z *= s` 和 head-relative translation `*= s`。
+- 真实 GPU `170603/170700` 得到 `0.897974/0.893756`，baseline RMSE 降到
+  `2.50/2.99 mm`；新 `102356` 得到 `0.851619`，RMSE `93.45 -> 2.25 mm`。三组 Step C、PLY、
+  voxel 全通过，voxel IoU `1.0000`；18 项测试通过。
+- 用户确认不同数据的尺度明显准确，但仍有少量未对齐。scale 只约束相机中心距离，最终相对
+  rotation/translation direction 仍来自模型，故不能直接归咎机器人标定。下一步用跨多组共同
+  刚性靶求 per-camera residual SE(3)：固定 residual 才支持外参，随场景变化支持模型，随关节
+  变化才支持 FK；另做 raw K/D 与 undistorted/new K A/B。
+- 最新输出：`outputs_pose_scale_fix_20260720` 和
+  `outputs_pose_scale_test_20260720_102356`；各目录保存完整 provenance/validation。
 
 ## 2026-07-15：G1 GUI capture 输入审查与修正
 
