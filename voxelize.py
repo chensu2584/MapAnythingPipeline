@@ -140,6 +140,15 @@ def voxelize_points(pts, cols, conf, voxel_size, origin, dims, view_bits=None):
     """Sparse occupancy grid by integer binning. pts must already lie inside
     [origin, origin + dims * voxel_size). Returns dict of per-voxel arrays,
     sorted by flat voxel index."""
+    # Every per-point array must have been filtered alongside pts.  Say so here:
+    # a mismatch otherwise surfaces as an opaque numpy broadcasting error deep
+    # inside the aggregation.
+    for label, values in (("cols", cols), ("conf", conf), ("view_bits", view_bits)):
+        if values is not None and len(values) != len(pts):
+            raise ValueError(
+                f"{label} has {len(values)} entries but pts has {len(pts)}; "
+                "per-point arrays must be filtered together"
+            )
     idx3 = np.floor((pts - origin) / voxel_size).astype(np.int64)
     np.clip(idx3, 0, np.asarray(dims) - 1, out=idx3)  # guard boundary rounding
     flat = np.ravel_multi_index((idx3[:, 0], idx3[:, 1], idx3[:, 2]), dims)
@@ -271,7 +280,7 @@ def process_capture(
     n_raw = pts.shape[0]
 
     keep = build_filter_mask(pts, conf, max_radius=max_radius, bbox=bbox, min_conf=min_conf)
-    pts, cols = pts[keep], cols[keep]
+    pts, cols, view_bits = pts[keep], cols[keep], view_bits[keep]
     conf = conf[keep] if conf is not None else None
     print(
         f"  pre-filter (max_radius={max_radius}, bbox={bbox}, min_conf={min_conf}): "
@@ -319,13 +328,21 @@ def process_capture(
         # Bit i is set when VIEW_NAMES[i] contributed a point to this voxel.
         source_views=vox["source_views"],
         source_view_names=np.asarray(list(VIEW_NAMES)),
-        # Declare the frame in the file itself so consumers never have to infer
-        # it from a sibling document.
-        world_frame=np.asarray(world_frame),
-        translation_unit=np.asarray("meter"),
         # Reserved for Task 2 (semantic lift): 0 = background/unknown.
         labels=np.zeros(n_vox, dtype=np.int32),
         label_scores=np.zeros(n_vox, dtype=np.float32),
+        # Declare the frame in the file itself when it is actually known.  An
+        # "unknown" placeholder would be worse than silence: consumers treat an
+        # embedded declaration as authoritative and stop falling back to the
+        # sibling pose document that does know the answer.
+        **(
+            {
+                "world_frame": np.asarray(world_frame),
+                "translation_unit": np.asarray("meter"),
+            }
+            if world_frame != "unknown"
+            else {}
+        ),
     )
 
     mesh = voxels_to_glb_mesh(vox["indices"], vox["colors"], voxel_size, origin)
