@@ -284,10 +284,22 @@ class UrdfRobot:
                 continue  # A link outside this base's tree is simply not placed.
         return poses
 
-    def world_geometry(self, joint_positions: dict, kind: str = "collision", links=None):
-        """Return ``[(link, vertices_in_base, faces)]`` for the requested geometry."""
+    def world_geometry(
+        self, joint_positions: dict, kind: str = "collision", links=None, shrink=None
+    ):
+        """Return ``[(link, vertices_in_base, faces)]`` for the requested geometry.
+
+        ``shrink`` maps a link-name substring to a scale factor applied about
+        that shape's own centroid.  It exists because a swept volume is not the
+        robot: G2's gripper collision mesh spans the full open/close travel, so
+        at wrist-camera range it covers far more of the frame than the gripper
+        actually occupies.  Shrinking is a blunt instrument and gives up the
+        guarantee that the geometry encloses the real part, so it is opt-in and
+        recorded rather than applied by default.
+        """
         poses = self.link_poses(joint_positions)
         wanted = set(links) if links else None
+        shrink = shrink or {}
         result = []
         for item in self.geometry_for(kind):
             if wanted is not None and item.link not in wanted:
@@ -295,6 +307,13 @@ class UrdfRobot:
             pose = poses.get(item.link)
             if pose is None:
                 continue
-            vertices = item.vertices @ pose[:3, :3].T + pose[:3, 3]
+            vertices = item.vertices
+            factor = next(
+                (value for key, value in shrink.items() if key in item.link), None
+            )
+            if factor is not None and factor != 1.0:
+                centroid = vertices.mean(axis=0)
+                vertices = centroid + (vertices - centroid) * float(factor)
+            vertices = vertices @ pose[:3, :3].T + pose[:3, 3]
             result.append((item.link, vertices, item.faces))
         return result

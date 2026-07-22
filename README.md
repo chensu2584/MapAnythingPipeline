@@ -172,6 +172,25 @@ python run_inference.py --captures snapshot_20260721_232128_0001 \
     --depth-input --depth-holdout 0.3
 ```
 
+### Robot self-occlusion masks
+
+`self_occlusion_mask.py` projects the robot's collision geometry through forward
+kinematics into each camera. Robot points are dropped from the exported cloud
+whenever a mask exists; `--self-mask-input` additionally blanks those pixels
+before inference.
+
+**Measured result: blanking makes the reconstruction worse on every view.** The
+gripper pixels are near-field structure the network anchors on, not noise, and a
+large flat grey region is itself a misleading signal. Use the mask to clean the
+output, not the input.
+
+G2's gripper collision mesh is a *swept volume* covering the full open/close
+travel, so at wrist-camera range it masks about a third of the frame — far more
+than the gripper occupies. `--shrink-links gripper=0.7` scales matching links
+about their own centroid and recovers most of the wrongly-masked scene. It gives
+up the guarantee that the shape encloses the real part, so it is opt-in and
+recorded in the output.
+
 ### Metric depth: report, scale anchor, or model input
 
 The head depth camera is metric, so it can play three different roles. They are
@@ -324,8 +343,27 @@ Bins the merged world-frame point cloud from `views.npz` into a fixed-resolution
 - `voxels.npz` — sparse grid: `indices (N,3) int32`, `origin (3,)`, `voxel_size`, `dims (3,)`, `counts`, `colors (N,3) uint8`, `conf`, plus `labels`/`label_scores` reserved as zeros for Task 2 (semantic lift)
 - `voxels.glb` — colored cube per occupied voxel, viewable alongside `scene.glb`
 
+## Diagnosis
+
+`diagnose_reconstruction.py` compares each view against the metric depth camera
+along shared rays and reports what `summary.json` cannot: a per-view range
+ratio, an affine test exposing a constant offset, and a radial/lateral split
+saying whether the error is a depth problem a metric prior can fix or a pose
+problem it cannot.
+
+```bash
+python diagnose_reconstruction.py --session <session> --output-root <out> --planes
+```
+
+`--planes` also characterises the depth camera itself on surfaces known to be
+flat, so its own noise and mounting tilt sit beside the numbers rather than
+being treated as truth.
+
 ## Docs
 
 - `PROJECT_LOG.md` — running project log
+- `G2_FINDINGS_20260722.md` — G2 reconstruction quality investigation: measured
+  error shape, four experiments, and the open root-cause question for the right
+  wrist view
 - `PLAN_SEMANTIC_VOXEL.md` — plan for the semantic voxel task
 - `TECH_DETAIL_TASK2.md` — technical details for task 2

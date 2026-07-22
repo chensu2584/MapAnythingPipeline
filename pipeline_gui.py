@@ -75,6 +75,7 @@ class PipelineConfig:
     self_mask_input: bool = False
     urdf: str = ""
     mask_dilate_px: int = 12
+    mask_gripper_shrink: float = 0.7
 
 
 def format_duration(seconds: float) -> str:
@@ -156,6 +157,8 @@ def build_pipeline_commands(
         )
     if not 0.0 <= config.depth_holdout < 1.0:
         raise ValueError("Depth holdout must be in [0, 1)")
+    if not 0.0 < config.mask_gripper_shrink <= 1.0:
+        raise ValueError("Gripper shrink must be in (0, 1]")
 
     py = str(python_executable)
     data_root = str(config.data_root.expanduser().resolve())
@@ -199,6 +202,8 @@ def build_pipeline_commands(
             "--dilate-px",
             str(config.mask_dilate_px),
         ]
+        if config.mask_gripper_shrink != 1.0:
+            command.extend(("--shrink-links", f"gripper={config.mask_gripper_shrink}"))
         _append_captures(command, config.captures)
         result.append(("self_mask", command))
 
@@ -317,6 +322,7 @@ class PipelineGui:
         self.self_mask_input_var = tk.BooleanVar(value=False)
         self.urdf_var = tk.StringVar(value="")
         self.mask_dilate_var = tk.StringVar(value="12")
+        self.mask_shrink_var = tk.StringVar(value="0.7")
         self.status_var = tk.StringVar(value="Ready")
         self.elapsed_var = tk.StringVar(value="Elapsed: --:--:--")
         self.stage_vars = {
@@ -582,6 +588,8 @@ class PipelineGui:
         ttk.Button(urdf_row, text="Browse", command=self.choose_urdf).grid(row=0, column=2, padx=(6, 0))
         ttk.Label(urdf_row, text="dilate px").grid(row=0, column=3, sticky="w", padx=(10, 6))
         ttk.Entry(urdf_row, textvariable=self.mask_dilate_var, width=6).grid(row=0, column=4)
+        ttk.Label(urdf_row, text="gripper shrink").grid(row=0, column=5, sticky="w", padx=(10, 6))
+        ttk.Entry(urdf_row, textvariable=self.mask_shrink_var, width=6).grid(row=0, column=6)
 
         holdout_row = ttk.Frame(options)
         holdout_row.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(4, 0))
@@ -764,6 +772,7 @@ class PipelineGui:
             self_mask_input=self.self_mask_input_var.get(),
             urdf=self.urdf_var.get().strip(),
             mask_dilate_px=int(self.mask_dilate_var.get() or 12),
+            mask_gripper_shrink=float(self.mask_shrink_var.get() or 1.0),
         )
 
     def start(self) -> None:

@@ -124,7 +124,23 @@ def encloses_camera(local_vertices, faces):
     return votes >= 2
 
 
-def render_mask(robot, joint_positions, K, base_T_cam, width, height, *, dilate_px=12, links=None):
+def parse_shrink(values):
+    """Parse ``substring=factor`` pairs into a mapping."""
+    result = {}
+    for item in values or []:
+        if "=" not in item:
+            raise ValueError(f"--shrink-links wants substring=factor, got {item!r}")
+        key, _, factor = item.partition("=")
+        value = float(factor)
+        if not 0.0 < value <= 1.0:
+            raise ValueError(f"Shrink factor must be in (0, 1], got {value}")
+        result[key] = value
+    return result
+
+
+def render_mask(
+    robot, joint_positions, K, base_T_cam, width, height, *, dilate_px=12, links=None, shrink=None
+):
     """Rasterise the robot's collision geometry into one camera."""
     import cv2
 
@@ -138,7 +154,9 @@ def render_mask(robot, joint_positions, K, base_T_cam, width, height, *, dilate_
         "links_enclosing_camera": [],
     }
 
-    for link, vertices, faces in robot.world_geometry(joint_positions, "collision", links=links):
+    for link, vertices, faces in robot.world_geometry(
+        joint_positions, "collision", links=links, shrink=shrink
+    ):
         local = vertices @ cam_T_world[:3, :3].T + cam_T_world[:3, 3]
         if not len(faces):
             continue
@@ -184,6 +202,7 @@ def render_mask(robot, joint_positions, K, base_T_cam, width, height, *, dilate_
             "coverage_fraction": float(mask.sum()) / (width * height),
             "dilate_px": int(dilate_px),
             "near_plane_m": NEAR_PLANE_M,
+            "shrink_links": dict(shrink or {}),
         }
     )
     return mask.astype(bool), stats
@@ -203,7 +222,9 @@ def camera_parameters(output_root: Path, capture: str, view: str):
     )
 
 
-def build_capture_masks(session, output_root, capture, profile, robot, *, dilate_px=12, preview=None):
+def build_capture_masks(
+    session, output_root, capture, profile, robot, *, dilate_px=12, preview=None, shrink=None
+):
     loaded = profile.load(session, capture)
     if not loaded.joint_positions:
         raise ValueError(f"{capture} carries no joint state; cannot place the robot")
@@ -213,7 +234,8 @@ def build_capture_masks(session, output_root, capture, profile, robot, *, dilate
     for view in profile.view_names:
         K, width, height, base_T_cam = camera_parameters(output_root, capture, view)
         mask, stats = render_mask(
-            robot, loaded.joint_positions, K, base_T_cam, width, height, dilate_px=dilate_px
+            robot, loaded.joint_positions, K, base_T_cam, width, height,
+            dilate_px=dilate_px, shrink=shrink,
         )
         payload[f"{view}_self_mask"] = mask
         report[view] = stats
@@ -222,6 +244,7 @@ def build_capture_masks(session, output_root, capture, profile, robot, *, dilate
     payload["views"] = np.asarray(list(profile.view_names))
     payload["dilate_px"] = np.asarray(dilate_px)
     payload["urdf"] = np.asarray(str(robot.path))
+    payload["shrink_links"] = np.asarray(json.dumps(shrink or {}))
     np.savez_compressed(undistorted / MASK_FILE, **payload)
     return report
 
@@ -257,12 +280,28 @@ def main() -> int:
             "of robot becomes an obstacle."
         ),
     )
+    parser.add_argument(
+        "--shrink-links",
+        action="append",
+        default=None,
+        metavar="SUBSTRING=FACTOR",
+        help=(
+            "Scale matching links about their own centroid, e.g. gripper=0.7. "
+            "G2's gripper collision mesh is a swept volume covering the whole "
+            "open/close travel, so at wrist range it masks far more than the "
+            "gripper occupies. Shrinking gives up the guarantee that the shape "
+            "encloses the real part, so it is opt-in and recorded in the output."
+        ),
+    )
     parser.add_argument("--preview", type=Path, help="Write mask overlays here for inspection")
     args = parser.parse_args()
 
     profile = get_profile(args.robot) if args.robot else detect_profile(args.session)
     captures = args.captures or profile.discover(args.session)
+    shrink = parse_shrink(args.shrink_links)
     robot = UrdfRobot(args.urdf, mesh_roots=args.mesh_root)
+    if shrink:
+        print(f"Shrinking links about their centroid: {shrink}")
     print(f"URDF: {robot.path}")
     print(f"Robot profile: {profile.name}, {len(captures)} captures")
 
@@ -270,7 +309,7 @@ def main() -> int:
         try:
             report = build_capture_masks(
                 args.session, args.output_root, capture, profile, robot,
-                dilate_px=args.dilate_px, preview=args.preview,
+                dilate_px=args.dilate_px, preview=args.preview, shrink=shrink,
             )
         except (OSError, ValueError, KeyError) as exc:
             print(f"  {capture}: FAILED {type(exc).__name__}: {exc}")
