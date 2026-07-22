@@ -358,5 +358,36 @@ class MaskReprojectionTests(unittest.TestCase):
         self.assertTrue(out[20, 20])
 
 
+class ViewOrderTests(unittest.TestCase):
+    """View 0 anchors the export, so only the wrist views may be reordered."""
+
+    @staticmethod
+    def resolve(spec):
+        source = (Path(__file__).resolve().parents[1] / "run_inference.py").read_text()
+        start = source.index("def resolve_view_order")
+        end = source.index("def load_registered_depth")
+        namespace = {"VIEW_NAMES": ("head", "hand_left", "hand_right")}
+        exec(source[start:end], namespace)  # noqa: S102 - isolated helper
+        return namespace["resolve_view_order"](spec)
+
+    def test_default_is_the_declared_order(self):
+        self.assertEqual(self.resolve(None), ("head", "hand_left", "hand_right"))
+
+    def test_wrist_views_can_be_swapped(self):
+        self.assertEqual(
+            self.resolve("head,hand_right,hand_left"),
+            ("head", "hand_right", "hand_left"),
+        )
+
+    def test_moving_the_head_off_view_zero_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "View 0 must stay"):
+            self.resolve("hand_left,head,hand_right")
+
+    def test_a_non_permutation_is_refused(self):
+        for bad in ("head,hand_left", "head,hand_left,hand_left", "head,hand_left,nope"):
+            with self.assertRaisesRegex(ValueError, "permutation"):
+                self.resolve(bad)
+
+
 if __name__ == "__main__":
     unittest.main()

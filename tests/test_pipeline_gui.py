@@ -318,6 +318,22 @@ class PipelineGuiG2Test(unittest.TestCase):
             )
             self.assertIn("--self-mask-input", commands["run_inference"])
 
+    def test_swapping_the_wrist_views_reaches_inference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for swap, expected in ((False, False), (True, True)):
+                commands = dict(
+                    MODULE.build_pipeline_commands(
+                        self.base_config(tmp, swap_wrist_views=swap),
+                        python_executable="py",
+                        script_dir=Path("/pipeline"),
+                    )
+                )
+                command = commands["run_inference"]
+                self.assertEqual("--view-order" in command, expected)
+                if expected:
+                    order = command[command.index("--view-order") + 1]
+                    self.assertEqual(order, "head,hand_right,hand_left")
+
     def test_invalid_holdout_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(ValueError, "holdout"):

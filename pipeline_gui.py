@@ -76,6 +76,7 @@ class PipelineConfig:
     urdf: str = ""
     mask_dilate_px: int = 12
     mask_gripper_shrink: float = 0.7
+    swap_wrist_views: bool = False
 
 
 def format_duration(seconds: float) -> str:
@@ -234,6 +235,10 @@ def build_pipeline_commands(
                 command.extend(("--depth-holdout", str(config.depth_holdout)))
         if config.self_mask_input:
             command.append("--self-mask-input")
+        if config.swap_wrist_views:
+            # Feed the wrist views in the opposite order. Outputs stay keyed by
+            # name; only the index each camera occupies changes.
+            command.extend(("--view-order", "head,hand_right,hand_left"))
         result.append(("run_inference", command))
 
     if "filter_export" in config.stages:
@@ -323,6 +328,7 @@ class PipelineGui:
         self.urdf_var = tk.StringVar(value="")
         self.mask_dilate_var = tk.StringVar(value="12")
         self.mask_shrink_var = tk.StringVar(value="0.7")
+        self.swap_wrist_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready")
         self.elapsed_var = tk.StringVar(value="Elapsed: --:--:--")
         self.stage_vars = {
@@ -591,6 +597,12 @@ class PipelineGui:
         ttk.Label(urdf_row, text="gripper shrink").grid(row=0, column=5, sticky="w", padx=(10, 6))
         ttk.Entry(urdf_row, textvariable=self.mask_shrink_var, width=6).grid(row=0, column=6)
 
+        ttk.Checkbutton(
+            options,
+            text="Swap the two wrist views (is the worst view worst by camera, or by index?)",
+            variable=self.swap_wrist_var,
+        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(7, 0))
+
         holdout_row = ttk.Frame(options)
         holdout_row.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         ttk.Label(holdout_row, text="Depth holdout fraction").grid(
@@ -773,6 +785,7 @@ class PipelineGui:
             urdf=self.urdf_var.get().strip(),
             mask_dilate_px=int(self.mask_dilate_var.get() or 12),
             mask_gripper_shrink=float(self.mask_shrink_var.get() or 1.0),
+            swap_wrist_views=self.swap_wrist_var.get(),
         )
 
     def start(self) -> None:

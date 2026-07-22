@@ -108,6 +108,34 @@ def _load_adjusted_K(path, image_width, image_height):
     return K
 
 
+def resolve_view_order(spec):
+    """Return the order views are fed to the model, defaulting to VIEW_NAMES.
+
+    Only the order changes; every output stays keyed by view name, so nothing
+    downstream has to know. View 0 stays the head because the export anchors the
+    calibrated head pose and fits scale relative to it.
+
+    Reordering exists to separate two explanations for one view always being the
+    worst: the physical camera's geometry, or its index. MapAnything makes all
+    poses relative to view 0, so the last view is not interchangeable with the
+    first by construction. If the error follows the index after a swap it is an
+    algorithmic effect; if it follows the camera it is geometry.
+    """
+    if not spec:
+        return tuple(VIEW_NAMES)
+    order = tuple(name.strip() for name in spec.split(",") if name.strip())
+    if sorted(order) != sorted(VIEW_NAMES):
+        raise ValueError(
+            f"--view-order must be a permutation of {VIEW_NAMES}, got {order}"
+        )
+    if order[0] != VIEW_NAMES[0]:
+        raise ValueError(
+            f"View 0 must stay {VIEW_NAMES[0]!r}: the export anchors that camera's "
+            f"calibrated pose, got {order[0]!r}"
+        )
+    return order
+
+
 def load_registered_depth(capture, undist_root=DEFAULT_UNDIST_ROOT):
     """Load Step A's metric depth, already reprojected into each colour view.
 
@@ -219,7 +247,9 @@ def load_views(
     depth_inputs=None,
     depth_holdout=0.0,
     self_masks=None,
+    view_order=None,
 ):
+    view_order = tuple(view_order or VIEW_NAMES)
     cap_dir = Path(undist_root) / capture
 
     poses = None
@@ -243,7 +273,7 @@ def load_views(
 
     views = []
     undistorted_intrinsics = {}
-    for name in VIEW_NAMES:
+    for name in view_order:
         image_path = cap_dir / f"{name}.png"
         img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if img_bgr is None:
@@ -290,11 +320,12 @@ def load_views(
     return views, pose_contract, undistorted_intrinsics
 
 
-def validate_preprocessed_views(raw_views, processed_views):
-    if len(processed_views) != len(VIEW_NAMES):
-        raise ValueError(f"Expected {len(VIEW_NAMES)} processed views")
-    report = {"view_order": list(VIEW_NAMES), "views": {}}
-    for name, raw, processed in zip(VIEW_NAMES, raw_views, processed_views):
+def validate_preprocessed_views(raw_views, processed_views, view_order=None):
+    view_order = tuple(view_order or VIEW_NAMES)
+    if len(processed_views) != len(view_order):
+        raise ValueError(f"Expected {len(view_order)} processed views")
+    report = {"view_order": list(view_order), "views": {}}
+    for name, raw, processed in zip(view_order, raw_views, processed_views):
         image = processed["img"]
         K = processed["intrinsics"]
         if image.ndim != 4 or image.shape[0] != 1 or image.shape[1] != 3:
@@ -337,6 +368,7 @@ def run_capture(
     use_depth_input=False,
     depth_holdout=0.0,
     use_self_mask_input=False,
+    view_order=None,
 ):
     capture_started_at = time.perf_counter()
     timings = {}
@@ -353,6 +385,10 @@ def run_capture(
             f"--self-mask-input was requested but {capture} has no self_occlusion_mask.npz; "
             "run self_occlusion_mask.py first"
         )
+
+    view_order = tuple(view_order or VIEW_NAMES)
+    if view_order != tuple(VIEW_NAMES):
+        print(f"  view order: {' -> '.join(view_order)} (default {' -> '.join(VIEW_NAMES)})")
 
     registered_depth = load_registered_depth(capture, undist_root)
     if registered_depth:
@@ -375,13 +411,14 @@ def run_capture(
         depth_inputs=registered_depth if use_depth_input else None,
         depth_holdout=depth_holdout,
         self_masks=self_masks if use_self_mask_input else None,
+        view_order=view_order,
     )
     timings["input_load"] = time.perf_counter() - section_started_at
     _print_timing("input_load", timings["input_load"])
 
     section_started_at = time.perf_counter()
     processed = preprocess_inputs(views)
-    preprocess_report = validate_preprocessed_views(views, processed)
+    preprocess_report = validate_preprocessed_views(views, processed, view_order)
     timings["preprocess_inputs"] = time.perf_counter() - section_started_at
     _print_timing("preprocess_inputs", timings["preprocess_inputs"])
     if pose_contract is None and any(v is not None for v in (max_radius, bbox)):
@@ -407,8 +444,8 @@ def run_capture(
     _synchronize_model_device(model)
     timings["model_inference"] = time.perf_counter() - section_started_at
     _print_timing("model_inference", timings["model_inference"])
-    if len(outputs) != len(VIEW_NAMES):
-        raise RuntimeError(f"Model returned {len(outputs)} views, expected {len(VIEW_NAMES)}")
+    if len(outputs) != len(view_order):
+        raise RuntimeError(f"Model returned {len(outputs)} views, expected {len(view_order)}")
 
     section_started_at = time.perf_counter()
     model_pose_arrays = [
@@ -430,7 +467,7 @@ def run_capture(
     depth_diagnostic = None
     if registered_depth:
         depth_diagnostic = {}
-        for view_index, name in enumerate(VIEW_NAMES):
+        for view_index, name in enumerate(view_order):
             if name not in registered_depth:
                 continue
             model_depth = (
@@ -461,7 +498,7 @@ def run_capture(
                     else f"not usable ({entry.get('reason')})"
                 )
             )
-        head_view = VIEW_NAMES[0]
+        head_view = view_order[0]
         if head_view in registered_depth:
             model_depth = (
                 outputs[0]["depth_z"][0].squeeze(-1).detach().cpu().numpy().astype(np.float64)
@@ -536,6 +573,7 @@ def run_capture(
         "pose_contract": pose_contract,
         "preprocess_validation": preprocess_report,
         "memory_efficient_inference": bool(memory_efficient_inference),
+        "view_order": list(view_order),
         "pose_export_mode_requested": pose_export_mode,
         "pose_export_mode_effective": effective_pose_mode,
         "camera_pose_used_for_export": pose_mode_labels[effective_pose_mode],
@@ -546,7 +584,7 @@ def run_capture(
         "self_occlusion_mask": self_mask_report,
         "pose_anchor": (
             {
-                "reference_view": VIEW_NAMES[0],
+                "reference_view": view_order[0],
                 "operation": (
                     "uniform_similarity_about_model_head_then_rigid_head_anchor"
                     if scale_report is not None
@@ -572,7 +610,7 @@ def run_capture(
     npz["pose_export_depth_offset_m"] = np.asarray(depth_offset_m, dtype=np.float32)
 
     for view_idx, pred in enumerate(outputs):
-        name = VIEW_NAMES[view_idx]
+        name = view_order[view_idx]
         model_depthmap = pred["depth_z"][0].squeeze(-1)  # (H, W), already metric-head scaled
         depthmap = model_depthmap * similarity_scale + depth_offset_m
         intrinsics = pred["intrinsics"][0]  # (3, 3)
@@ -709,7 +747,7 @@ def run_capture(
     for i in range(len(cam_translations)):
         for j in range(i + 1, len(cam_translations)):
             d = float(np.linalg.norm(cam_translations[i] - cam_translations[j]))
-            key = f"{VIEW_NAMES[i]}__{VIEW_NAMES[j]}"
+            key = f"{view_order[i]}__{view_order[j]}"
             baselines[key] = round(d, 4)
     summary["baselines_m"] = baselines
     print(f"  baselines(m): {baselines}")
@@ -721,9 +759,12 @@ def run_capture(
 
     # Optional export filters (stackable); geometry in views.npz stays unfiltered.
     if any(f is not None for f in (max_radius, bbox, min_conf)):
+        # Stack in view_order: world_points and final_masks were built in that
+        # order, and mixing the two would filter each view by another's
+        # confidence.
         conf_stack = (
-            np.stack([npz[f"{n}_conf"] for n in VIEW_NAMES], axis=0)
-            if f"{VIEW_NAMES[0]}_conf" in npz
+            np.stack([npz[f"{n}_conf"] for n in view_order], axis=0)
+            if f"{view_order[0]}_conf" in npz
             else None
         )
         keep = build_filter_mask(
@@ -797,6 +838,7 @@ def run_capture(
         "translation_unit": (
             "meter" if pose_contract is not None else "arbitrary_model_scale"
         ),
+        "view_order": list(view_order),
         "pose_export_mode_requested": pose_export_mode,
         "pose_export_mode_effective": effective_pose_mode,
         "similarity_scale_correction": scale_metadata,
@@ -807,7 +849,7 @@ def run_capture(
         "anchor": summary["pose_anchor"],
         "poses": {
             name: export_pose_arrays[index].tolist()
-            for index, name in enumerate(VIEW_NAMES)
+            for index, name in enumerate(view_order)
         },
     }
     export_pose_filename = "camera_poses_used_for_export.json"
@@ -879,6 +921,19 @@ def main():
         ),
     )
     parser.add_argument(
+        "--view-order",
+        default=None,
+        metavar="head,hand_x,hand_y",
+        help=(
+            "Order the views are fed to the model, as a permutation of "
+            f"{','.join(VIEW_NAMES)}. Outputs stay keyed by name. View 0 must "
+            "stay the head. Swapping the two wrist views separates whether the "
+            "consistently worst view is worst because of its camera geometry or "
+            "because of its index, since the model makes all poses relative to "
+            "view 0."
+        ),
+    )
+    parser.add_argument(
         "--self-mask-input",
         action="store_true",
         help=(
@@ -933,6 +988,7 @@ def main():
         help="Export filter: keep points with confidence >= this value",
     )
     args = parser.parse_args()
+    view_order = resolve_view_order(args.view_order)
     run_started_at = time.perf_counter()
     captures = resolve_captures(args.input_root, args.captures, preprocessed=True)
     filter_kwargs = dict(
@@ -989,6 +1045,7 @@ def main():
                 use_depth_input=args.depth_input,
                 depth_holdout=args.depth_holdout,
                 use_self_mask_input=args.self_mask_input,
+                view_order=view_order,
                 memory_efficient_inference=not args.fast_inference,
                 **filter_kwargs,
             )
@@ -1010,6 +1067,7 @@ def main():
                 use_depth_input=args.depth_input,
                 depth_holdout=args.depth_holdout,
                 use_self_mask_input=args.self_mask_input,
+                view_order=view_order,
                 memory_efficient_inference=True,
                 **filter_kwargs,
             )

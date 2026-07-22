@@ -191,6 +191,23 @@ about their own centroid and recovers most of the wrongly-masked scene. It gives
 up the guarantee that the shape encloses the real part, so it is opt-in and
 recorded in the output.
 
+### Which view is worst, and why
+
+One wrist view is consistently the worst on both G1 and G2. Two explanations fit
+equally: that camera's geometry (on G2 its optical axis sits 39-42 degrees off
+the head's, against 26-28 for the other wrist), or its index, since MapAnything
+makes every pose relative to view 0 and the last view is not interchangeable
+with the first by construction.
+
+`--view-order head,hand_right,hand_left` swaps the two wrist views. Outputs stay
+keyed by name; only the index each camera occupies changes, and view 0 must stay
+the head because the export anchors that camera's calibrated pose. Run it, then
+compare the `lateral` column from `diagnose_reconstruction.py`:
+
+- the error follows the **index** (the new third view degrades) — algorithmic,
+  and calibration will not fix it
+- the error follows the **camera** (still `hand_right`) — geometry
+
 ### Metric depth: report, scale anchor, or model input
 
 The head depth camera is metric, so it can play three different roles. They are
