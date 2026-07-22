@@ -188,5 +188,92 @@ class PipelineGuiCommandTest(unittest.TestCase):
         self.assertEqual(MODULE.format_duration(3661.0), "01:01:01")
 
 
+
+class PipelineGuiG2Test(unittest.TestCase):
+    def make_roots(self, tmp):
+        g1 = Path(tmp) / "g1"
+        (g1 / "cap").mkdir(parents=True)
+        for name in MODULE.RAW_REQUIRED_FILES:
+            (g1 / "cap" / name).write_text("x", encoding="utf-8")
+        g2 = Path(tmp) / "g2"
+        (g2 / "snapshot_0001").mkdir(parents=True)
+        (g2 / "snapshot_0001" / MODULE.G2_REQUIRED_FILE).write_text("{}", encoding="utf-8")
+        return g1, g2
+
+    def test_discovery_separates_the_two_layouts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g1, g2 = self.make_roots(tmp)
+            self.assertEqual(MODULE.discover_captures(g1), ["cap"])
+            self.assertEqual(MODULE.discover_captures(g2), ["snapshot_0001"])
+            self.assertEqual(MODULE.discover_captures(g2, "g1"), [])
+            self.assertEqual(MODULE.discover_captures(g1, "g2"), [])
+            self.assertEqual(MODULE.detect_root_layout(g1), "g1")
+            self.assertEqual(MODULE.detect_root_layout(g2), "g2")
+
+    def base_config(self, tmp, **overrides):
+        options = dict(
+            data_root=Path(tmp),
+            output_root=Path(tmp) / "out",
+            captures=("snapshot_0001",),
+            stages=MODULE.STAGES,
+            robot="g2",
+        )
+        options.update(overrides)
+        return MODULE.PipelineConfig(**options)
+
+    def test_g2_passes_robot_and_never_asks_for_gripper_markers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = dict(
+                MODULE.build_pipeline_commands(
+                    self.base_config(tmp, show_gripper_markers=True),
+                    python_executable="py",
+                    script_dir=Path("/pipeline"),
+                )
+            )
+            self.assertIn("--robot", commands["undistort"])
+            self.assertIn("g2", commands["undistort"])
+            # The gripper overlay is G1-only and would abort Steps C/D on G2.
+            self.assertNotIn("--show_grippers", commands["filter_export"])
+            self.assertNotIn("--show_grippers", commands["voxelize"])
+
+    def test_g1_still_gets_gripper_markers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = dict(
+                MODULE.build_pipeline_commands(
+                    self.base_config(tmp, robot="g1", show_gripper_markers=True),
+                    python_executable="py",
+                    script_dir=Path("/pipeline"),
+                )
+            )
+            self.assertIn("--show_grippers", commands["filter_export"])
+            # The resolved robot is always stated explicitly rather than left to
+            # undistort.py's layout detection.
+            self.assertIn("g1", commands["undistort"])
+
+    def test_depth_options_reach_inference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = dict(
+                MODULE.build_pipeline_commands(
+                    self.base_config(tmp, depth_input=True, depth_holdout=0.3),
+                    python_executable="py",
+                    script_dir=Path("/pipeline"),
+                )
+            )
+            command = commands["run_inference"]
+            self.assertIn("--depth-input", command)
+            self.assertIn("--depth-holdout", command)
+            self.assertIn("0.3", command)
+
+    def test_unresolved_robot_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "resolved"):
+                MODULE.build_pipeline_commands(self.base_config(tmp, robot="auto"))
+
+    def test_invalid_holdout_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "holdout"):
+                MODULE.build_pipeline_commands(self.base_config(tmp, depth_holdout=1.5))
+
+
 if __name__ == "__main__":
     unittest.main()

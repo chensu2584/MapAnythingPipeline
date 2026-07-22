@@ -23,12 +23,17 @@ from pose_export import (
     DEFAULT_POSE_EXPORT_MODE,
     MODEL_RELATIVE_HEAD_ANCHORED,
     MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED,
+    MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_SCALED,
     POSE_EXPORT_MODES,
 )
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 STAGES = ("undistort", "run_inference", "filter_export", "voxelize")
+# "auto" is a UI choice only: it is resolved to a concrete robot when the
+# config is read, so command construction never has to guess.
+ROBOT_CHOICES = ("auto", "g1", "g2")
+ROBOT_PROFILES = ("g1", "g2")
 RAW_REQUIRED_FILES = {
     "head.png",
     "hand_left.png",
@@ -37,6 +42,8 @@ RAW_REQUIRED_FILES = {
     "intrinsic_hand_left_rgb.json",
     "intrinsic_hand_right_rgb.json",
 }
+# A G2 snapshot is identified by its single extrinsics document instead.
+G2_REQUIRED_FILE = "camera_extrinsics.json"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,6 +63,9 @@ class PipelineConfig:
     export_per_camera_k_ab_glb: bool = False
     reuse_preprocessed: bool = True
     fast_inference: bool = False
+    robot: str = "g1"
+    depth_input: bool = False
+    depth_holdout: float = 0.0
 
 
 def format_duration(seconds: float) -> str:
@@ -67,18 +77,44 @@ def format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def discover_captures(data_root: Path) -> list[str]:
+def capture_layout(child: Path) -> str | None:
+    """Return the robot layout of one folder, or None when it is not a capture."""
+
+    if all((child / filename).is_file() for filename in RAW_REQUIRED_FILES):
+        return "g1"
+    if (child / G2_REQUIRED_FILE).is_file():
+        return "g2"
+    return None
+
+
+def discover_captures(data_root: Path, robot: str = "auto") -> list[str]:
     """Find raw capture folders without importing heavy pipeline packages."""
 
     root = data_root.expanduser()
     if not root.is_dir():
         return []
-    return sorted(
-        child.name
+    found = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        layout = capture_layout(child)
+        if layout is not None and robot in ("auto", layout):
+            found.append(child.name)
+    return found
+
+
+def detect_root_layout(data_root: Path) -> str | None:
+    """Return the single layout a folder holds, or None if empty or mixed."""
+
+    root = data_root.expanduser()
+    if not root.is_dir():
+        return None
+    layouts = {
+        layout
         for child in root.iterdir()
-        if child.is_dir()
-        and all((child / filename).is_file() for filename in RAW_REQUIRED_FILES)
-    )
+        if child.is_dir() and (layout := capture_layout(child)) is not None
+    }
+    return layouts.pop() if len(layouts) == 1 else None
 
 
 def _append_captures(command: list[str], captures: Iterable[str]) -> None:
@@ -104,6 +140,13 @@ def build_pipeline_commands(
         raise ValueError("Max radius must be positive when supplied")
     if config.pose_export_mode not in POSE_EXPORT_MODES:
         raise ValueError(f"Unknown pose export mode: {config.pose_export_mode}")
+    if config.robot not in ROBOT_PROFILES:
+        raise ValueError(
+            f"Robot must be resolved to one of {ROBOT_PROFILES} before building "
+            f"commands, got {config.robot!r}"
+        )
+    if not 0.0 <= config.depth_holdout < 1.0:
+        raise ValueError("Depth holdout must be in [0, 1)")
 
     py = str(python_executable)
     data_root = str(config.data_root.expanduser().resolve())
@@ -121,6 +164,7 @@ def build_pipeline_commands(
             "--output-root",
             output_root,
         ]
+        command.extend(("--robot", config.robot))
         _append_captures(command, config.captures)
         if not config.use_metric_poses:
             command.append("--ignore-poses")
@@ -149,6 +193,10 @@ def build_pipeline_commands(
             command.extend(("--max_radius", str(config.max_radius)))
         if config.fast_inference:
             command.append("--fast-inference")
+        if config.depth_input:
+            command.append("--depth-input")
+            if config.depth_holdout > 0.0:
+                command.extend(("--depth-holdout", str(config.depth_holdout)))
         result.append(("run_inference", command))
 
     if "filter_export" in config.stages:
@@ -164,7 +212,7 @@ def build_pipeline_commands(
             command.extend(("--max_radius", str(config.max_radius)))
         if config.show_scene_markers:
             command.append("--show_cameras")
-        if config.show_gripper_markers:
+        if config.show_gripper_markers and config.robot == "g1":
             command.append("--show_grippers")
         if config.export_view_colored_glb:
             command.append("--color_by_view")
@@ -185,7 +233,7 @@ def build_pipeline_commands(
         _append_captures(command, config.captures)
         if config.max_radius is not None:
             command.extend(("--max_radius", str(config.max_radius)))
-        if config.show_gripper_markers:
+        if config.show_gripper_markers and config.robot == "g1":
             command.append("--show_grippers")
         result.append(("voxelize", command))
 
@@ -215,6 +263,9 @@ class PipelineGui:
         self.export_per_camera_k_ab_glb_var = tk.BooleanVar(value=False)
         self.reuse_preprocessed_var = tk.BooleanVar(value=True)
         self.fast_inference_var = tk.BooleanVar(value=False)
+        self.robot_var = tk.StringVar(value="auto")
+        self.depth_input_var = tk.BooleanVar(value=False)
+        self.depth_holdout_var = tk.StringVar(value="0.3")
         self.status_var = tk.StringVar(value="Ready")
         self.elapsed_var = tk.StringVar(value="Elapsed: --:--:--")
         self.stage_vars = {
@@ -439,6 +490,35 @@ class PipelineGui:
             variable=self.fast_inference_var,
         ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
+        robot_row = ttk.Frame(options)
+        robot_row.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        ttk.Label(robot_row, text="Robot").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.robot_combo = ttk.Combobox(
+            robot_row,
+            textvariable=self.robot_var,
+            values=ROBOT_CHOICES,
+            state="readonly",
+            width=8,
+        )
+        self.robot_combo.grid(row=0, column=1, sticky="w")
+        self.robot_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self.refresh_captures()
+        )
+        ttk.Checkbutton(
+            options,
+            text="Feed metric depth to the model (G2 only)",
+            variable=self.depth_input_var,
+            command=self._update_pose_mode_text,
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        holdout_row = ttk.Frame(options)
+        holdout_row.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(holdout_row, text="Depth holdout fraction").grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        ttk.Entry(holdout_row, textvariable=self.depth_holdout_var, width=8).grid(
+            row=0, column=1, sticky="w"
+        )
+
         actions = ttk.Frame(self.root)
         actions.grid(row=2, column=0, sticky="ew", padx=14, pady=8)
         actions.columnconfigure(0, weight=1)
@@ -487,7 +567,9 @@ class PipelineGui:
             self.output_root_var.set(selected)
 
     def refresh_captures(self) -> None:
-        self.capture_names = discover_captures(Path(self.data_root_var.get()))
+        self.capture_names = discover_captures(
+            Path(self.data_root_var.get()), self.robot_var.get()
+        )
         self.capture_list.delete(0, tk.END)
         for name in self.capture_names:
             self.capture_list.insert(tk.END, name)
@@ -510,6 +592,22 @@ class PipelineGui:
                     "baselines, scale model depth and relative translations together, "
                     "then anchor the calibrated head."
                 )
+            elif (
+                self.pose_export_mode_var.get()
+                == MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_SCALED
+            ):
+                note = (
+                    "G2 only: fit that scale per pixel against the metric head depth "
+                    "camera instead of three camera baselines, which constrains scene "
+                    "depth directly. Falls back to the baseline fit and records why if "
+                    "the depth fit cannot be defended."
+                )
+                if self.depth_input_var.get():
+                    note += (
+                        "  Depth is also being fed to the model, so the head-view "
+                        "agreement is circular: set a holdout fraction above 0."
+                    )
+                self.pose_mode_var.set(note)
             elif self.pose_export_mode_var.get() == MODEL_RELATIVE_HEAD_ANCHORED:
                 self.pose_mode_var.set(
                     "Unscaled diagnostic: preserve MapAnything geometry and rigidly anchor "
@@ -544,6 +642,13 @@ class PipelineGui:
         device = self.device_var.get().strip()
         if not device:
             raise ValueError("Inference device cannot be empty")
+        holdout_text = self.depth_holdout_var.get().strip()
+        depth_holdout = float(holdout_text) if holdout_text else 0.0
+        # Resolve "auto" here so command construction never has to guess which
+        # robot-specific flags apply.
+        robot = self.robot_var.get()
+        if robot == "auto":
+            robot = detect_root_layout(data_root) or "g1"
         return PipelineConfig(
             data_root=data_root,
             output_root=output_root,
@@ -562,6 +667,9 @@ class PipelineGui:
             ),
             reuse_preprocessed=self.reuse_preprocessed_var.get(),
             fast_inference=self.fast_inference_var.get(),
+            robot=robot,
+            depth_input=self.depth_input_var.get(),
+            depth_holdout=depth_holdout,
         )
 
     def start(self) -> None:
