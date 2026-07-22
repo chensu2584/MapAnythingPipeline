@@ -40,6 +40,7 @@ from pose_export import (
     MODEL_PREDICTION_ARBITRARY_SCALE,
     MODEL_RELATIVE_HEAD_ANCHORED,
     MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED,
+    MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_AFFINE,
     MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_SCALED,
     POSE_EXPORT_MODES,
     estimate_depth_similarity_scale,
@@ -413,6 +414,17 @@ def run_capture(
         f"effective={effective_pose_mode}"
     )
     similarity_scale = scale_report["scale"] if scale_report is not None else 1.0
+    # Only the affine diagnostic mode sets an offset; every other mode leaves
+    # this at zero and stays a pure similarity transform.
+    depth_offset_m = (
+        float(scale_report.get("depth_offset_m", 0.0)) if scale_report else 0.0
+    )
+    if depth_offset_m:
+        print(
+            f"  DIAGNOSTIC affine depth correction: depth = {similarity_scale:.6f} * model "
+            f"{depth_offset_m:+.4f} m -- this warps geometry and breaks cross-camera "
+            "agreement; do not plan against this output"
+        )
     scale_metadata = scale_report or {
         "applied": False,
         "scale": 1.0,
@@ -467,11 +479,12 @@ def run_capture(
     npz["pose_export_similarity_scale"] = np.asarray(
         similarity_scale, dtype=np.float32
     )
+    npz["pose_export_depth_offset_m"] = np.asarray(depth_offset_m, dtype=np.float32)
 
     for view_idx, pred in enumerate(outputs):
         name = VIEW_NAMES[view_idx]
         model_depthmap = pred["depth_z"][0].squeeze(-1)  # (H, W), already metric-head scaled
-        depthmap = model_depthmap * similarity_scale
+        depthmap = model_depthmap * similarity_scale + depth_offset_m
         intrinsics = pred["intrinsics"][0]  # (3, 3)
         model_cam_pose = pred["camera_poses"][0]
         # Keep network depth and network relative camera geometry self-consistent.

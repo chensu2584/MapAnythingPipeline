@@ -130,7 +130,7 @@ def fit_scale_robust(
     valid: np.ndarray,
     *,
     max_iterations: int = 20,
-    tolerance: float = 1e-9,
+    convergence_tolerance: float = 1e-9,
 ) -> dict[str, Any]:
     """Fit ``reference ~= scale * model`` with an iteratively reweighted Huber loss.
 
@@ -168,7 +168,7 @@ def fit_scale_robust(
         delta = max(spread, 1e-6)
         absolute = np.abs(residual)
         weights = np.where(absolute <= delta, 1.0, delta / absolute)
-        if abs(scale - previous) <= tolerance:
+        if abs(scale - previous) <= convergence_tolerance:
             break
 
     residual = y - scale * x
@@ -178,8 +178,28 @@ def fit_scale_robust(
     # worthless as a quality gate.
     tolerance = np.maximum(ABSOLUTE_INLIER_TOLERANCE_M, RELATIVE_INLIER_TOLERANCE * y)
     inliers = np.abs(residual) <= tolerance
+
+    # Fit the unconstrained affine form with the same robust weighting, so its
+    # quality can be judged on the same terms as the single-scale fit rather
+    # than being reported as a bare pair of coefficients.
     design = np.stack([x, np.ones_like(x)], axis=1)
     affine, *_ = np.linalg.lstsq(design, y, rcond=None)
+    affine_weights = np.ones_like(x)
+    for _ in range(max_iterations):
+        weighted = design * affine_weights[:, None]
+        previous = affine
+        affine, *_ = np.linalg.lstsq(weighted.T @ design, weighted.T @ y, rcond=None)
+        affine_residual = y - design @ affine
+        spread = 1.4826 * float(
+            np.median(np.abs(affine_residual - np.median(affine_residual)))
+        )
+        delta = max(spread, 1e-6)
+        absolute = np.abs(affine_residual)
+        affine_weights = np.where(absolute <= delta, 1.0, delta / absolute)
+        if np.max(np.abs(affine - previous)) <= convergence_tolerance:
+            break
+    affine_residual = y - design @ affine
+    affine_inliers = np.abs(affine_residual) <= tolerance
 
     return {
         "converged": True,
@@ -199,6 +219,9 @@ def fit_scale_robust(
         "affine_test": {
             "a": float(affine[0]),
             "b_m": float(affine[1]),
+            "residual_rmse_m": float(np.sqrt(np.mean(affine_residual**2))),
+            "residual_median_abs_m": float(np.median(np.abs(affine_residual))),
+            "inlier_ratio": float(affine_inliers.mean()),
             "note": (
                 "reference ~= a * model + b; |b| well above the residual RMSE means "
                 "the error is not a pure scale error and one global scalar cannot fix it"
