@@ -329,18 +329,24 @@ class MaskReprojectionTests(unittest.TestCase):
         np.testing.assert_array_equal(out, mask)
 
     def test_a_cropped_target_maps_by_intrinsics_not_by_size(self):
-        """A centre crop must sample the centre, not the whole frame."""
+        """A centre crop must sample the centre, not the whole frame.
+
+        The robot occupies only the outer left strip, which a centre crop does
+        not see at all.  Size-only mapping would stretch that strip across the
+        crop and call scene pixels robot.
+        """
         mask = np.zeros((100, 100), bool)
-        mask[:, :50] = True  # left half is robot
+        mask[:, :25] = True  # robot sits in the outer left strip only
         K_source = np.array([[100.0, 0, 50.0], [0, 100.0, 50.0], [0, 0, 1.0]])
         # Target sees the central 50x50 of the source at the same resolution.
         K_target = np.array([[100.0, 0, 25.0], [0, 100.0, 25.0], [0, 0, 1.0]])
         out = self.reproject(mask, K_source, K_target, (50, 50))
-        # Source columns 25..75 -> the left 25 target columns are robot.
-        self.assertTrue(out[:, :24].all())
-        self.assertFalse(out[:, 26:].any())
-        # Size-only mapping would have called half the frame robot instead.
-        self.assertNotAlmostEqual(out.mean(), 0.5, places=2)
+        # The crop covers source columns 25..74, none of which are robot.
+        self.assertFalse(out.any())
+
+        rows = np.clip((np.arange(50) + 0.5) * 100 / 50, 0, 99).astype(int)
+        by_size = mask[np.ix_(rows, rows)]
+        self.assertGreater(by_size.mean(), 0.2)  # would have masked real scene
 
     def test_target_pixels_outside_the_source_are_not_robot(self):
         mask = np.ones((20, 20), bool)
