@@ -186,10 +186,20 @@ output, not the input.
 
 G2's gripper collision mesh is a *swept volume* covering the full open/close
 travel, so at wrist-camera range it masks about a third of the frame — far more
-than the gripper occupies. `--shrink-links gripper=0.7` scales matching links
-about their own centroid and recovers most of the wrongly-masked scene. It gives
-up the guarantee that the shape encloses the real part, so it is opt-in and
-recorded in the output.
+than the gripper occupies, and being solid it also fills the gaps the real open
+gripper is seen through. `--shrink-links gripper=0.7` scales matching links about
+their own centroid and recovers much of the wrongly-masked scene, but cannot
+recover what the solid envelope fills in.
+
+**Do not assume the URDF describes the installed end effector.** On this robot it
+places each wrist camera at the flange origin, which the measured calibration
+puts 10 cm away, so at least that part of the description is a placeholder.
+
+The reliable alternative needs no model at all: a gripper is rigid with respect
+to its own wrist camera, so it occupies the same pixels in every frame however
+the arm moves. Draw the mask once on the undistorted image and pass it with
+`--static-mask hand_right=mask.png`; it stays exact for every capture from that
+camera and survives changing the end effector.
 
 ### Which view is worst, and why
 

@@ -124,6 +124,41 @@ def encloses_camera(local_vertices, faces):
     return votes >= 2
 
 
+def load_static_masks(values, expected_shapes=None):
+    """Load hand-painted per-camera masks: ``view=path.png``.
+
+    A wrist camera and its gripper are rigidly attached, so the gripper occupies
+    the same pixels in every frame no matter how the arm moves.  One mask drawn
+    once is therefore exact for every capture from that camera, and it depends on
+    no URDF, no joint angles and no assumption that the installed end effector
+    matches the model.  That matters here: G2's URDF places the wrist camera at
+    the flange origin, which the measured calibration puts 10 cm away, so at
+    least part of that description does not match the hardware.
+
+    Any non-zero pixel counts as robot.
+    """
+    import cv2
+
+    result = {}
+    for item in values or []:
+        if "=" not in item:
+            raise ValueError(f"--static-mask wants view=path, got {item!r}")
+        view, _, path = item.partition("=")
+        if view not in VIEW_NAMES:
+            raise ValueError(f"Unknown view {view!r}; expected one of {VIEW_NAMES}")
+        image = cv2.imread(str(Path(path).expanduser()), cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            raise FileNotFoundError(f"Cannot read static mask: {path}")
+        expected = (expected_shapes or {}).get(view)
+        if expected is not None and image.shape[:2] != tuple(expected):
+            raise ValueError(
+                f"Static mask for {view} is {image.shape[:2]}, but the undistorted "
+                f"view is {tuple(expected)}. Draw it on the undistorted image."
+            )
+        result[view] = image > 0
+    return result
+
+
 def parse_shrink(values):
     """Parse ``substring=factor`` pairs into a mapping."""
     result = {}
@@ -223,7 +258,8 @@ def camera_parameters(output_root: Path, capture: str, view: str):
 
 
 def build_capture_masks(
-    session, output_root, capture, profile, robot, *, dilate_px=12, preview=None, shrink=None
+    session, output_root, capture, profile, robot, *, dilate_px=12, preview=None,
+    shrink=None, static_masks=None,
 ):
     loaded = profile.load(session, capture)
     if not loaded.joint_positions:
@@ -233,10 +269,29 @@ def build_capture_masks(
     report = {}
     for view in profile.view_names:
         K, width, height, base_T_cam = camera_parameters(output_root, capture, view)
-        mask, stats = render_mask(
-            robot, loaded.joint_positions, K, base_T_cam, width, height,
-            dilate_px=dilate_px, shrink=shrink,
-        )
+        if static_masks and view in static_masks:
+            painted = static_masks[view]
+            if painted.shape != (height, width):
+                raise ValueError(
+                    f"Static mask for {view} is {painted.shape}, undistorted view "
+                    f"is {(height, width)}"
+                )
+            mask = painted
+            stats = {
+                "source": "hand_painted_static_mask",
+                "raw_pixels": int(mask.sum()),
+                "dilated_pixels": int(mask.sum()),
+                "coverage_fraction": float(mask.mean()),
+                "note": (
+                    "the gripper is rigid with respect to this camera, so one drawn "
+                    "mask holds for every capture and needs no URDF"
+                ),
+            }
+        else:
+            mask, stats = render_mask(
+                robot, loaded.joint_positions, K, base_T_cam, width, height,
+                dilate_px=dilate_px, shrink=shrink,
+            )
         payload[f"{view}_self_mask"] = mask
         report[view] = stats
         if preview is not None:
@@ -245,6 +300,7 @@ def build_capture_masks(
     payload["dilate_px"] = np.asarray(dilate_px)
     payload["urdf"] = np.asarray(str(robot.path))
     payload["shrink_links"] = np.asarray(json.dumps(shrink or {}))
+    payload["hand_painted_views"] = np.asarray(sorted(static_masks or {}))
     np.savez_compressed(undistorted / MASK_FILE, **payload)
     return report
 
@@ -293,12 +349,27 @@ def main() -> int:
             "encloses the real part, so it is opt-in and recorded in the output."
         ),
     )
+    parser.add_argument(
+        "--static-mask",
+        action="append",
+        default=None,
+        metavar="VIEW=PATH.png",
+        help=(
+            "Use a hand-painted mask for this view instead of projected URDF "
+            "geometry. The gripper is rigid with respect to its wrist camera, so "
+            "one mask drawn on the undistorted image is exact for every capture "
+            "and survives changing the end effector."
+        ),
+    )
     parser.add_argument("--preview", type=Path, help="Write mask overlays here for inspection")
     args = parser.parse_args()
 
     profile = get_profile(args.robot) if args.robot else detect_profile(args.session)
     captures = args.captures or profile.discover(args.session)
     shrink = parse_shrink(args.shrink_links)
+    static_masks = load_static_masks(args.static_mask)
+    if static_masks:
+        print(f"Hand-painted static masks for: {sorted(static_masks)}")
     robot = UrdfRobot(args.urdf, mesh_roots=args.mesh_root)
     if shrink:
         print(f"Shrinking links about their centroid: {shrink}")
@@ -310,6 +381,7 @@ def main() -> int:
             report = build_capture_masks(
                 args.session, args.output_root, capture, profile, robot,
                 dilate_px=args.dilate_px, preview=args.preview, shrink=shrink,
+                static_masks=static_masks,
             )
         except (OSError, ValueError, KeyError) as exc:
             print(f"  {capture}: FAILED {type(exc).__name__}: {exc}")
