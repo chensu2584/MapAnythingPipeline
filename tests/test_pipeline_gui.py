@@ -324,5 +324,53 @@ class PipelineGuiG2Test(unittest.TestCase):
                 MODULE.build_pipeline_commands(self.base_config(tmp, depth_holdout=1.5))
 
 
+class PipelineGuiLayoutTest(unittest.TestCase):
+    """Two widgets sharing a grid cell silently hide one of them."""
+
+    def setUp(self):
+        import tkinter as tk
+
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as exc:
+            raise unittest.SkipTest(f"no display: {exc}") from exc
+        self.root.withdraw()
+        self.app = MODULE.PipelineGui(self.root)
+
+    def tearDown(self):
+        self.root.destroy()
+
+    def collisions(self, widget, path="root"):
+        cells, found = {}, []
+        for child in widget.winfo_children():
+            info = child.grid_info()
+            if info:
+                cell = (info.get("row"), info.get("column"))
+                if cell in cells:
+                    found.append(f"{path} cell {cell}: {cells[cell]} hidden by {child.winfo_class()}")
+                cells[cell] = child.winfo_class()
+            found += self.collisions(child, f"{path}/{child.winfo_class()}")
+        return found
+
+    def test_no_two_widgets_share_a_grid_cell(self):
+        found = self.collisions(self.root)
+        self.assertEqual(found, [], "overlapping widgets: " + "; ".join(found))
+
+    def test_every_export_mode_is_offered_and_described(self):
+        self.assertEqual(
+            tuple(self.app.pose_export_combo["values"]), tuple(MODULE.POSE_EXPORT_MODES)
+        )
+        # Each mode must produce its own description, not another mode's.
+        seen = {}
+        for mode in MODULE.POSE_EXPORT_MODES:
+            self.app.pose_export_mode_var.set(mode)
+            self.app._update_pose_mode_text()
+            seen[mode] = self.app.pose_mode_var.get()
+        self.assertEqual(len(set(seen.values())), len(seen), f"duplicate descriptions: {seen}")
+        self.assertIn(
+            "DIAGNOSTIC", seen[MODULE.MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_AFFINE]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

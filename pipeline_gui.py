@@ -468,15 +468,19 @@ class PipelineGui:
             ttk.Checkbutton(settings, text=labels[name], variable=self.stage_vars[name]).grid(
                 row=row, column=0, sticky="w", pady=2
             )
-        ttk.Separator(settings).grid(row=len(ALL_STAGES) + 1, column=0, sticky="ew", pady=8)
+        # A running counter rather than literal row numbers: hand-maintained
+        # indices silently stack two widgets in one cell when the list above
+        # changes length, and the later one simply hides the earlier.
+        next_row = iter(range(len(ALL_STAGES) + 1, 100)).__next__
+        ttk.Separator(settings).grid(row=next_row(), column=0, sticky="ew", pady=8)
         ttk.Checkbutton(
             settings,
             text="Use calibrated camera extrinsics as model input",
             variable=self.use_poses_var,
             command=self._update_pose_mode_text,
-        ).grid(row=8, column=0, sticky="w")
+        ).grid(row=next_row(), column=0, sticky="w")
         pose_selector = ttk.Frame(settings)
-        pose_selector.grid(row=9, column=0, sticky="ew", pady=(6, 0))
+        pose_selector.grid(row=next_row(), column=0, sticky="ew", pady=(6, 0))
         pose_selector.columnconfigure(1, weight=1)
         ttk.Label(pose_selector, text="Output geometry").grid(
             row=0, column=0, sticky="w", padx=(0, 8)
@@ -494,10 +498,10 @@ class PipelineGui:
         )
         ttk.Label(
             settings, textvariable=self.pose_mode_var, wraplength=520, foreground="#7c2d12"
-        ).grid(row=10, column=0, sticky="ew", pady=(4, 10))
+        ).grid(row=next_row(), column=0, sticky="ew", pady=(4, 10))
 
         options = ttk.Frame(settings)
-        options.grid(row=9, column=0, sticky="ew")
+        options.grid(row=next_row(), column=0, sticky="ew")
         options.columnconfigure(1, weight=1)
         ttk.Label(options, text="Max radius (blank = none)").grid(row=0, column=0, sticky="w")
         ttk.Entry(options, textvariable=self.max_radius_var, width=10).grid(
