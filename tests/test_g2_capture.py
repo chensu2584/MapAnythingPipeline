@@ -307,5 +307,50 @@ class DepthScaledModeTests(unittest.TestCase):
         self.assertFalse(report["depth_scale_rejected"]["applied"])
 
 
+class MaskReprojectionTests(unittest.TestCase):
+    """Preprocessing crops as well as resizes, so size-only mapping is wrong."""
+
+    @staticmethod
+    def reproject(*args):
+        import importlib.util
+
+        source = (Path(__file__).resolve().parents[1] / "run_inference.py").read_text()
+        start = source.index("def reproject_mask_with_intrinsics")
+        end = source.index("def resample_depth_to")
+        namespace = {"np": np}
+        exec(source[start:end], namespace)  # noqa: S102 - isolated helper
+        return namespace["reproject_mask_with_intrinsics"](*args)
+
+    def test_identity_intrinsics_round_trip(self):
+        mask = np.zeros((40, 50), bool)
+        mask[10:20, 15:30] = True
+        K = np.array([[100.0, 0, 25.0], [0, 100.0, 20.0], [0, 0, 1.0]])
+        out = self.reproject(mask, K, K, (40, 50))
+        np.testing.assert_array_equal(out, mask)
+
+    def test_a_cropped_target_maps_by_intrinsics_not_by_size(self):
+        """A centre crop must sample the centre, not the whole frame."""
+        mask = np.zeros((100, 100), bool)
+        mask[:, :50] = True  # left half is robot
+        K_source = np.array([[100.0, 0, 50.0], [0, 100.0, 50.0], [0, 0, 1.0]])
+        # Target sees the central 50x50 of the source at the same resolution.
+        K_target = np.array([[100.0, 0, 25.0], [0, 100.0, 25.0], [0, 0, 1.0]])
+        out = self.reproject(mask, K_source, K_target, (50, 50))
+        # Source columns 25..75 -> the left 25 target columns are robot.
+        self.assertTrue(out[:, :24].all())
+        self.assertFalse(out[:, 26:].any())
+        # Size-only mapping would have called half the frame robot instead.
+        self.assertNotAlmostEqual(out.mean(), 0.5, places=2)
+
+    def test_target_pixels_outside_the_source_are_not_robot(self):
+        mask = np.ones((20, 20), bool)
+        K_source = np.array([[10.0, 0, 10.0], [0, 10.0, 10.0], [0, 0, 1.0]])
+        # Target is twice as wide a field, so its edges fall outside the source.
+        K_target = np.array([[5.0, 0, 20.0], [0, 5.0, 20.0], [0, 0, 1.0]])
+        out = self.reproject(mask, K_source, K_target, (40, 40))
+        self.assertFalse(out[0, 0])
+        self.assertTrue(out[20, 20])
+
+
 if __name__ == "__main__":
     unittest.main()

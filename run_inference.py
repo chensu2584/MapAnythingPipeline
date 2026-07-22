@@ -151,7 +151,12 @@ def load_self_occlusion_masks(capture, undist_root=DEFAULT_UNDIST_ROOT):
 
 
 def resample_mask_to(mask, target_hw):
-    """Nearest-neighbour resample a boolean mask to ``target_hw``."""
+    """Nearest-neighbour resample a boolean mask to ``target_hw`` by size alone.
+
+    Only valid when the target is a plain rescale of the source.  Use
+    ``reproject_mask_with_intrinsics`` whenever a K is available: preprocessing
+    crops as well as resizes, and a size-only mapping silently shifts the mask.
+    """
     target_h, target_w = (int(v) for v in target_hw)
     height, width = mask.shape
     if (height, width) == (target_h, target_w):
@@ -159,6 +164,34 @@ def resample_mask_to(mask, target_hw):
     rows = np.clip((np.arange(target_h) + 0.5) * height / target_h, 0, height - 1).astype(int)
     cols = np.clip((np.arange(target_w) + 0.5) * width / target_w, 0, width - 1).astype(int)
     return mask[np.ix_(rows, cols)]
+
+
+def reproject_mask_with_intrinsics(mask, K_source, K_target, target_hw):
+    """Map a mask between two pinhole views of the same optical axis.
+
+    ``preprocess_inputs`` crops before it resizes, so the model's output grid
+    does not cover the whole input frame.  Mapping by image size alone therefore
+    stretches the mask across a frame it no longer matches -- on the G2 wrist
+    views that is a ~19 percent stretch and up to ~100 px of displacement near
+    the edges, enough to move the mask off the gripper and onto the scene.
+
+    Both grids share an optical centre, so the pixel mapping follows exactly
+    from the two intrinsic matrices and needs no assumption about how the crop
+    was chosen.
+    """
+    target_h, target_w = (int(v) for v in target_hw)
+    height, width = mask.shape
+    K_source = np.asarray(K_source, dtype=np.float64)
+    K_target = np.asarray(K_target, dtype=np.float64)
+    u = (np.arange(target_w) + 0.5 - K_target[0, 2]) / K_target[0, 0] * K_source[0, 0] + K_source[0, 2]
+    v = (np.arange(target_h) + 0.5 - K_target[1, 2]) / K_target[1, 1] * K_source[1, 1] + K_source[1, 2]
+    cols = np.rint(u - 0.5).astype(int)
+    rows = np.rint(v - 0.5).astype(int)
+    inside_x = (cols >= 0) & (cols < width)
+    inside_y = (rows >= 0) & (rows < height)
+    sampled = mask[np.ix_(np.clip(rows, 0, height - 1), np.clip(cols, 0, width - 1))]
+    # A target pixel outside the source frame saw no robot geometry.
+    return sampled & inside_y[:, None] & inside_x[None, :]
 
 
 def resample_depth_to(depth, valid, target_hw):
@@ -209,6 +242,7 @@ def load_views(
         print("  no camera pose file found; model will estimate poses (arbitrary scale)")
 
     views = []
+    undistorted_intrinsics = {}
     for name in VIEW_NAMES:
         image_path = cap_dir / f"{name}.png"
         img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -252,7 +286,8 @@ def load_views(
                 + (f" (holdout {depth_holdout:.0%})" if depth_holdout > 0 else "")
             )
         views.append(view)
-    return views, pose_contract
+        undistorted_intrinsics[name] = K.astype(np.float64)
+    return views, pose_contract, undistorted_intrinsics
 
 
 def validate_preprocessed_views(raw_views, processed_views):
@@ -332,7 +367,7 @@ def run_capture(
         )
 
     section_started_at = time.perf_counter()
-    views, pose_contract = load_views(
+    views, pose_contract, undistorted_K = load_views(
         capture,
         undist_root,
         allow_missing_poses,
@@ -561,7 +596,11 @@ def run_capture(
         # robot from the exported cloud is always right, because those points
         # are the robot, not the scene it has to avoid.
         if self_masks and name in self_masks:
-            robot_pixels = resample_mask_to(self_masks[name], mask.shape)
+            # Map through the intrinsics: preprocessing cropped as well as
+            # resized, so the output grid covers only part of the input frame.
+            robot_pixels = reproject_mask_with_intrinsics(
+                self_masks[name], undistorted_K[name], K_np, mask.shape
+            )
             removed = int((mask & robot_pixels).sum())
             mask = mask & ~robot_pixels
             self_mask_report[name] = {
@@ -904,7 +943,7 @@ def main():
         print(f"Validating captures: {', '.join(captures)}")
         for capture in captures:
             print(f"\n===== {capture} =====")
-            views, contract = load_views(
+            views, contract, _ = load_views(
                 capture,
                 args.input_root,
                 args.allow_missing_poses,
