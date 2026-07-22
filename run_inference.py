@@ -752,19 +752,21 @@ def run_capture(
     summary["baselines_m"] = baselines
     print(f"  baselines(m): {baselines}")
 
-    # Stack for GLB (all views share the unified resolution after preprocess_inputs)
-    world_points = np.stack(world_points_list, axis=0)
-    images = np.stack(images_list, axis=0)
-    final_masks = np.stack(masks_list, axis=0)
+    # Stack for GLB/PLY in the declared view order, never the feed order.  The
+    # order views are given to the model is an inference-time detail, but the
+    # exported point sequence is a contract: filter_export replays scene.ply
+    # point by point, so a reordered export silently compares each view against
+    # a different one.
+    canonical = [view_order.index(name) for name in VIEW_NAMES]
+    world_points = np.stack([world_points_list[i] for i in canonical], axis=0)
+    images = np.stack([images_list[i] for i in canonical], axis=0)
+    final_masks = np.stack([masks_list[i] for i in canonical], axis=0)
 
     # Optional export filters (stackable); geometry in views.npz stays unfiltered.
     if any(f is not None for f in (max_radius, bbox, min_conf)):
-        # Stack in view_order: world_points and final_masks were built in that
-        # order, and mixing the two would filter each view by another's
-        # confidence.
         conf_stack = (
-            np.stack([npz[f"{n}_conf"] for n in view_order], axis=0)
-            if f"{view_order[0]}_conf" in npz
+            np.stack([npz[f"{n}_conf"] for n in VIEW_NAMES], axis=0)
+            if f"{VIEW_NAMES[0]}_conf" in npz
             else None
         )
         keep = build_filter_mask(

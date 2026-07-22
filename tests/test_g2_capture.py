@@ -383,6 +383,29 @@ class ViewOrderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "View 0 must stay"):
             self.resolve("hand_left,head,hand_right")
 
+    def test_exports_are_reordered_back_to_the_declared_order(self):
+        """The feed order must not leak into the exported point sequence.
+
+        filter_export replays scene.ply point by point against its own
+        VIEW_NAMES-ordered reconstruction, so an export left in feed order
+        compares each view against a different one.  That surfaced as a 4.18 m
+        deviation on a real swapped run.
+        """
+        declared = ("head", "hand_left", "hand_right")
+        for feed in (declared, ("head", "hand_right", "hand_left")):
+            # Each view contributes a block of points tagged with its index in
+            # the declared order.
+            per_view = {name: np.full((2, 3), index) for index, name in enumerate(declared)}
+            stacked_in_feed_order = [per_view[name] for name in feed]
+
+            canonical = [feed.index(name) for name in declared]
+            exported = np.stack([stacked_in_feed_order[i] for i in canonical], axis=0)
+
+            expected = np.stack([per_view[name] for name in declared], axis=0)
+            np.testing.assert_array_equal(
+                exported, expected, err_msg=f"feed order {feed} leaked into the export"
+            )
+
     def test_a_non_permutation_is_refused(self):
         for bad in ("head,hand_left", "head,hand_left,hand_left", "head,hand_left,nope"):
             with self.assertRaisesRegex(ValueError, "permutation"):
