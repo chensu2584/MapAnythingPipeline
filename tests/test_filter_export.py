@@ -34,6 +34,32 @@ class UnprojectionConsistencyTests(unittest.TestCase):
                 computed, stored, np.array([[True]])
             )
 
+    def test_allows_the_bf16_replay_error_seen_on_real_g2_data(self):
+        """Regression: a real G2 capture failed here by 4.6 percent.
+
+        The point sat 12.61 m from the origin with an 8.69 mm L-infinity error,
+        a relative error of 6.9e-4.  That is comfortably inside bfloat16's own
+        3.9e-3 relative precision, so rejecting it was a tolerance bug rather
+        than a geometry error.
+        """
+        stored = np.array([[[0.0, 0.0, 12.6145515]]], dtype=np.float32)
+        computed = stored.copy()
+        computed[0, 0, 0] += 0.00869369507
+        stats = validate_unprojection_consistency(
+            computed, stored, np.array([[True]])
+        )
+        self.assertLess(stats["max_tolerance_ratio"], 1.0)
+
+    def test_still_rejects_a_wrong_frame_convention(self):
+        """A real convention error is wrong by a fraction of the coordinates."""
+        stored = np.array([[[0.3, 0.4, 12.0]]], dtype=np.float32)
+        computed = stored.copy()
+        computed[0, 0, 1] *= -1.0  # e.g. RDF read as RUB
+        with self.assertRaisesRegex(AssertionError, "inconsistent"):
+            validate_unprojection_consistency(
+                computed, stored, np.array([[True]])
+            )
+
     def test_empty_mask_is_well_defined(self):
         points = np.zeros((1, 1, 3), dtype=np.float32)
         stats = validate_unprojection_consistency(
