@@ -545,6 +545,14 @@ def process_capture(
     gripper_poses = None
     gripper_pose_path = None
     if show_grippers:
+        # G1-only: the overlay resolves G1 link names and needs the G1
+        # pose_conversion_manifest.json.  Say so rather than failing on a bare
+        # missing file when this runs against another robot's capture.
+        if not os.path.isfile(os.path.join(out_dir, "pose_conversion_manifest.json")):
+            raise ValueError(
+                "--show_grippers is G1-specific: it needs pose_conversion_manifest.json, "
+                f"which {capture} does not have. Omit the flag for non-G1 captures."
+            )
         gripper_poses = resolve_gripper_poses(
             out_dir,
             g1_urdf=g1_urdf,

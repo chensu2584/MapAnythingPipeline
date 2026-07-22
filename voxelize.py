@@ -96,25 +96,47 @@ def build_filter_mask(pts3d, conf, max_radius=None, bbox=None, min_conf=None):
     return keep
 
 
+def read_export_world_frame(out_dir):
+    """Read the frame the reconstruction was exported in, or say it is unknown.
+
+    Guessing here would silently mislabel a grid that downstream avoidance code
+    trusts, so an unreadable or absent declaration stays "unknown".
+    """
+    path = os.path.join(out_dir, "camera_poses_used_for_export.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError):
+        return "unknown"
+    frame = document.get("world_frame")
+    return frame if isinstance(frame, str) and frame else "unknown"
+
+
 def load_points(capture, output_root=DEFAULT_OUTPUT_ROOT):
     """Merged filtered-input point cloud from views.npz.
     Returns (pts (N,3) f32, cols (N,3) f32 in [0,1], conf (N,) f32 or None)."""
     npz = np.load(os.path.join(output_root, capture, "views.npz"))
-    pts_list, col_list, conf_list = [], [], []
+    pts_list, col_list, conf_list, view_list = [], [], [], []
     have_conf = all(f"{n}_conf" in npz for n in VIEW_NAMES)
-    for name in VIEW_NAMES:
+    for index, name in enumerate(VIEW_NAMES):
         mask = npz[f"{name}_mask"].astype(bool)
         pts_list.append(npz[f"{name}_pts3d"][mask])
         col_list.append(npz[f"{name}_img"][mask].astype(np.float32) / 255.0)
+        # Remember which camera saw each point.  Which views agree on a voxel is
+        # a strong self-filter cue: gripper surfaces are typically seen only by
+        # the wrist camera on the same arm, while real scene geometry near the
+        # hand is also seen from the head.
+        view_list.append(np.full(int(mask.sum()), 1 << index, dtype=np.uint8))
         if have_conf:
             conf_list.append(npz[f"{name}_conf"][mask])
     pts = np.concatenate(pts_list, axis=0).astype(np.float32)
     cols = np.concatenate(col_list, axis=0)
     conf = np.concatenate(conf_list, axis=0) if have_conf else None
-    return pts, cols, conf
+    view_bits = np.concatenate(view_list, axis=0)
+    return pts, cols, conf, view_bits
 
 
-def voxelize_points(pts, cols, conf, voxel_size, origin, dims):
+def voxelize_points(pts, cols, conf, voxel_size, origin, dims, view_bits=None):
     """Sparse occupancy grid by integer binning. pts must already lie inside
     [origin, origin + dims * voxel_size). Returns dict of per-voxel arrays,
     sorted by flat voxel index."""
@@ -137,11 +159,17 @@ def voxelize_points(pts, cols, conf, voxel_size, origin, dims):
         conf_max = np.full(n, np.nan, dtype=np.float32)
 
     indices = np.stack(np.unravel_index(uniq, dims), axis=1).astype(np.int32)
+    if view_bits is not None:
+        source_views = np.zeros(n, dtype=np.uint8)
+        np.bitwise_or.at(source_views, inverse, view_bits.astype(np.uint8))
+    else:
+        source_views = np.zeros(n, dtype=np.uint8)
     return {
         "indices": indices,
         "counts": counts.astype(np.int32),
         "colors": np.clip(mean_colors * 255.0, 0, 255).astype(np.uint8),
         "conf": conf_max,
+        "source_views": source_views,
     }
 
 
@@ -239,7 +267,7 @@ def process_capture(
     out_dir = os.path.join(output_root, capture)
     print(f"\n===== {capture} =====")
 
-    pts, cols, conf = load_points(capture, output_root)
+    pts, cols, conf, view_bits = load_points(capture, output_root)
     n_raw = pts.shape[0]
 
     keep = build_filter_mask(pts, conf, max_radius=max_radius, bbox=bbox, min_conf=min_conf)
@@ -264,7 +292,7 @@ def process_capture(
         int(v) for v in np.maximum(np.floor(extent / voxel_size).astype(np.int64) + 1, 1)
     )
 
-    vox = voxelize_points(pts, cols, conf, voxel_size, origin, dims)
+    vox = voxelize_points(pts, cols, conf, voxel_size, origin, dims, view_bits)
     n_vox = vox["indices"].shape[0]
     occ_pct = 100.0 * n_vox / float(np.prod(dims))
     print(
@@ -274,6 +302,8 @@ def process_capture(
     )
 
     crosscheck_open3d(pts, cols, voxel_size, origin, dims, vox["indices"])
+
+    world_frame = read_export_world_frame(out_dir)
 
     # Sparse grid for downstream (robot / Task 2 semantic lift).
     npz_path = os.path.join(out_dir, "voxels.npz")
@@ -286,6 +316,13 @@ def process_capture(
         counts=vox["counts"],
         colors=vox["colors"],
         conf=vox["conf"],
+        # Bit i is set when VIEW_NAMES[i] contributed a point to this voxel.
+        source_views=vox["source_views"],
+        source_view_names=np.asarray(list(VIEW_NAMES)),
+        # Declare the frame in the file itself so consumers never have to infer
+        # it from a sibling document.
+        world_frame=np.asarray(world_frame),
+        translation_unit=np.asarray("meter"),
         # Reserved for Task 2 (semantic lift): 0 = background/unknown.
         labels=np.zeros(n_vox, dtype=np.int32),
         label_scores=np.zeros(n_vox, dtype=np.float32),
@@ -297,6 +334,14 @@ def process_capture(
     gripper_pose_path = None
     export_geometry = mesh
     if show_grippers:
+        # The overlay resolves G1 link names against the G1 URDF and needs the
+        # G1-only pose_conversion_manifest.json.  Check for it up front so a G2
+        # capture gets told why rather than a bare missing-file error.
+        if not os.path.isfile(os.path.join(out_dir, "pose_conversion_manifest.json")):
+            raise ValueError(
+                "--show_grippers is G1-specific: it needs pose_conversion_manifest.json, "
+                f"which {capture} does not have. Omit the flag for non-G1 captures."
+            )
         gripper_poses = resolve_gripper_poses(
             out_dir,
             g1_urdf=g1_urdf,

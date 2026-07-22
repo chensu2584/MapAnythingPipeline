@@ -40,7 +40,9 @@ from pose_export import (
     MODEL_PREDICTION_ARBITRARY_SCALE,
     MODEL_RELATIVE_HEAD_ANCHORED,
     MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED,
+    MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_SCALED,
     POSE_EXPORT_MODES,
+    estimate_depth_similarity_scale,
     pose_delta,
     select_export_poses,
 )
@@ -105,11 +107,55 @@ def _load_adjusted_K(path, image_width, image_height):
     return K
 
 
+def load_registered_depth(capture, undist_root=DEFAULT_UNDIST_ROOT):
+    """Load Step A's metric depth, already reprojected into each colour view.
+
+    Returns ``{view: (depth_z, valid)}`` in meters, or an empty dict when the
+    capture carries no depth.  Absent depth is normal (G1 has none) and must not
+    be an error.
+    """
+    path = Path(undist_root) / capture / "registered_depth.npz"
+    if not path.is_file():
+        return {}
+    result = {}
+    with np.load(path, allow_pickle=False) as data:
+        for key in data.files:
+            if not key.endswith("_depth_z"):
+                continue
+            view = key[: -len("_depth_z")]
+            valid_key = f"{view}_depth_valid"
+            if valid_key not in data.files:
+                continue
+            depth = np.asarray(data[key], dtype=np.float64)
+            valid = np.asarray(data[valid_key], dtype=bool) & np.isfinite(depth)
+            result[view] = (depth, valid)
+    return result
+
+
+def resample_depth_to(depth, valid, target_hw):
+    """Nearest-neighbour resample a depth map and its validity to ``target_hw``.
+
+    Nearest neighbour rather than interpolation: averaging across a depth
+    discontinuity invents a surface that exists in neither the sensor nor the
+    model, and this map is used to fit a scale.
+    """
+    target_h, target_w = (int(v) for v in target_hw)
+    height, width = depth.shape
+    if (height, width) == (target_h, target_w):
+        return depth, valid
+    rows = np.clip((np.arange(target_h) + 0.5) * height / target_h, 0, height - 1).astype(int)
+    cols = np.clip((np.arange(target_w) + 0.5) * width / target_w, 0, width - 1).astype(int)
+    index = np.ix_(rows, cols)
+    return depth[index], valid[index]
+
+
 def load_views(
     capture,
     undist_root=DEFAULT_UNDIST_ROOT,
     allow_missing_poses=False,
     ignore_poses=False,
+    depth_inputs=None,
+    depth_holdout=0.0,
 ):
     cap_dir = Path(undist_root) / capture
 
@@ -149,6 +195,21 @@ def load_views(
             pose = np.asarray(poses[name], dtype=np.float32)
             view["camera_poses"] = torch.from_numpy(pose)
             view["is_metric_scale"] = torch.ones(1, dtype=torch.bool)
+        if depth_inputs and name in depth_inputs:
+            depth, valid = depth_inputs[name]
+            fed = np.where(valid, depth, 0.0).astype(np.float32)
+            if depth_holdout > 0.0:
+                # Withhold a random subset so the head view keeps pixels the model
+                # never saw; evaluating a fed-in depth against itself is circular.
+                rng = np.random.default_rng(abs(hash((capture, name))) % (2**32))
+                held = rng.random(fed.shape) < float(depth_holdout)
+                fed[held] = 0.0
+            view["depth_z"] = torch.from_numpy(fed)
+            view["is_metric_scale"] = torch.ones(1, dtype=torch.bool)
+            print(
+                f"  depth input: {name} feeding {int((fed > 0).sum())} metric pixels"
+                + (f" (holdout {depth_holdout:.0%})" if depth_holdout > 0 else "")
+            )
         views.append(view)
     return views, pose_contract
 
@@ -197,6 +258,8 @@ def run_capture(
     ignore_poses=False,
     pose_export_mode=DEFAULT_POSE_EXPORT_MODE,
     memory_efficient_inference=True,
+    use_depth_input=False,
+    depth_holdout=0.0,
 ):
     capture_started_at = time.perf_counter()
     timings = {}
@@ -204,12 +267,26 @@ def run_capture(
     os.makedirs(out_dir, exist_ok=True)
     print(f"\n===== {capture} =====")
 
+    registered_depth = load_registered_depth(capture, undist_root)
+    if registered_depth:
+        print(
+            "  registered metric depth available for: "
+            + ", ".join(sorted(registered_depth))
+        )
+    elif use_depth_input:
+        raise FileNotFoundError(
+            f"--depth-input was requested but {capture} has no registered_depth.npz; "
+            "run Step A on a capture whose robot provides a metric depth camera"
+        )
+
     section_started_at = time.perf_counter()
     views, pose_contract = load_views(
         capture,
         undist_root,
         allow_missing_poses,
         ignore_poses=ignore_poses,
+        depth_inputs=registered_depth if use_depth_input else None,
+        depth_holdout=depth_holdout,
     )
     timings["input_load"] = time.perf_counter() - section_started_at
     _print_timing("input_load", timings["input_load"])
@@ -258,6 +335,58 @@ def run_capture(
         if pose_contract is not None
         else None
     )
+    # Compare predicted head depth against the measured metric depth.  This runs
+    # whatever the export mode is: as a standalone quality report by default, and
+    # additionally as the scale estimator when the depth-scaled mode is asked for.
+    depth_scale_inputs = None
+    depth_diagnostic = None
+    if registered_depth:
+        depth_diagnostic = {}
+        for view_index, name in enumerate(VIEW_NAMES):
+            if name not in registered_depth:
+                continue
+            model_depth = (
+                outputs[view_index]["depth_z"][0].squeeze(-1).detach().cpu().numpy()
+                .astype(np.float64)
+            )
+            reference, valid = registered_depth[name]
+            reference, valid = resample_depth_to(reference, valid, model_depth.shape)
+            entry = estimate_depth_similarity_scale(model_depth, reference, valid)
+            entry["was_fed_to_model"] = bool(use_depth_input)
+            entry["depth_holdout_fraction"] = float(depth_holdout)
+            if use_depth_input and depth_holdout <= 0.0:
+                entry["evaluation_warning"] = (
+                    "this depth was fed to the model, so agreement here is circular; "
+                    "use --depth-holdout or judge the views that were not fed"
+                )
+            depth_diagnostic[name] = entry
+            print(
+                f"  depth check[{name}]: "
+                + (
+                    f"scale={entry['scale']:.6f} "
+                    f"residual RMSE={entry['residual_rmse_m'] * 1000:.1f} mm "
+                    f"median={entry['residual_median_abs_m'] * 1000:.1f} mm "
+                    f"inliers={entry['inlier_ratio']:.1%} "
+                    f"affine b={entry['affine_test']['b_m'] * 1000:+.1f} mm "
+                    f"over {entry['pixel_count']} px"
+                    if entry.get("converged")
+                    else f"not usable ({entry.get('reason')})"
+                )
+            )
+        head_view = VIEW_NAMES[0]
+        if head_view in registered_depth:
+            model_depth = (
+                outputs[0]["depth_z"][0].squeeze(-1).detach().cpu().numpy().astype(np.float64)
+            )
+            reference, valid = resample_depth_to(
+                *registered_depth[head_view], model_depth.shape
+            )
+            depth_scale_inputs = {
+                "model_depth": model_depth,
+                "reference_depth": reference,
+                "valid": valid,
+            }
+
     (
         export_pose_arrays,
         effective_pose_mode,
@@ -268,6 +397,7 @@ def run_capture(
             model_pose_arrays,
             calibrated_pose_arrays,
             requested_mode=pose_export_mode,
+            depth_scale_inputs=depth_scale_inputs,
         )
     )
     pose_mode_labels = {
@@ -311,6 +441,7 @@ def run_capture(
         "pose_export_mode_effective": effective_pose_mode,
         "camera_pose_used_for_export": pose_mode_labels[effective_pose_mode],
         "similarity_scale_correction": scale_metadata,
+        "metric_depth_diagnostic": depth_diagnostic,
         "pose_anchor": (
             {
                 "reference_view": VIEW_NAMES[0],
@@ -549,6 +680,7 @@ def run_capture(
         "pose_export_mode_requested": pose_export_mode,
         "pose_export_mode_effective": effective_pose_mode,
         "similarity_scale_correction": scale_metadata,
+        "metric_depth_diagnostic": depth_diagnostic,
         "anchor": summary["pose_anchor"],
         "poses": {
             name: export_pose_arrays[index].tolist()
@@ -608,7 +740,29 @@ def main():
             "Final geometry when metric poses are supplied. Default estimates one "
             "uniform scale from calibrated/model camera baselines, applies it to "
             "model depth and relative translations, then anchors the calibrated "
-            "head. Other choices preserve the unscaled model geometry or legacy hybrid."
+            "head. depth-scaled instead fits that scale per pixel against a metric "
+            "depth camera and falls back to the baseline fit if the depth fit cannot "
+            "be defended. Other choices preserve the unscaled model geometry or "
+            "legacy hybrid."
+        ),
+    )
+    parser.add_argument(
+        "--depth-input",
+        action="store_true",
+        help=(
+            "Feed the registered metric depth to the model as a per-view depth_z "
+            "prior instead of only using it afterwards. Requires a robot with a "
+            "metric depth camera (G2)."
+        ),
+    )
+    parser.add_argument(
+        "--depth-holdout",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of depth pixels to withhold from --depth-input so the "
+            "diagnostic still has pixels the model never saw. Without it, agreement "
+            "on a fed-in view is circular and proves nothing."
         ),
     )
     parser.add_argument(
@@ -700,6 +854,8 @@ def main():
                 allow_missing_poses=args.allow_missing_poses,
                 ignore_poses=args.ignore_poses,
                 pose_export_mode=args.pose_export_mode,
+                use_depth_input=args.depth_input,
+                depth_holdout=args.depth_holdout,
                 memory_efficient_inference=not args.fast_inference,
                 **filter_kwargs,
             )
@@ -718,6 +874,8 @@ def main():
                 allow_missing_poses=args.allow_missing_poses,
                 ignore_poses=args.ignore_poses,
                 pose_export_mode=args.pose_export_mode,
+                use_depth_input=args.depth_input,
+                depth_holdout=args.depth_holdout,
                 memory_efficient_inference=True,
                 **filter_kwargs,
             )

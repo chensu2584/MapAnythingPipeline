@@ -134,6 +134,73 @@ Image preprocessing remains enabled: pose/intrinsic preservation checks and edge
 masking affect reconstruction validity and are not removed for speed. The GUI sends
 all selected captures to one inference process, so model weights load once per batch.
 
+## G2 support
+
+`--robot g2` (or auto-detection from the folder layout) reads a G2 capture
+session of `snapshot_*` folders instead of the flat G1 capture layout:
+
+```
+session_.../snapshot_.../
+    head_rgb.png  hand_left_rgb.png  hand_right_rgb.png   (three colour views)
+    head_depth_raw16.png                                  (uint16 millimetres)
+    camera_extrinsics.json                                (intrinsics + base_T_camera + joints)
+```
+
+G2 already ships metric `base_T_camera` matrices in OpenCV RDF, so no forward
+kinematics has to be re-derived. Step A validates them (SO(3), the redundant
+quaternion/inverse/translation copies, camera synchronisation, the capture
+script's own FK-vs-SDK check) and then rewrites them into the same
+`camera_poses_opencv_cam2world.json` every later stage already consumes. Steps
+B-D therefore do not need to know which robot produced the capture.
+
+```bash
+# Step A: undistort + register depth into the undistorted colour frame
+python undistort.py --robot g2 \
+    --data-root /path/to/session_20260721_232012 \
+    --output-root /path/to/outputs
+
+# Step B: inference, with the metric depth used only as a quality report
+python run_inference.py --captures snapshot_20260721_232128_0001
+
+# Step B, version 1: let the measured depth set the reconstruction scale
+python run_inference.py --captures snapshot_20260721_232128_0001 \
+    --pose-export-mode model-relative-head-anchored-depth-scaled
+
+# Step B, version 2: feed the depth to the model as a fourth input modality,
+# withholding 30 percent of pixels so the diagnostic stays honest
+python run_inference.py --captures snapshot_20260721_232128_0001 \
+    --depth-input --depth-holdout 0.3
+```
+
+### Metric depth: report, scale anchor, or model input
+
+The head depth camera is metric, so it can play three different roles. They are
+independent and can be combined:
+
+| Role | Flag | What it does |
+|---|---|---|
+| Quality report | *(always on when depth exists)* | Fits predicted vs measured head depth and writes the result to `summary.json`; does not change the reconstruction |
+| Scale anchor | `--pose-export-mode ...-depth-scaled` | Uses that fit as the similarity scale instead of the three camera baselines |
+| Model input | `--depth-input` | Passes `depth_z` + `is_metric_scale` into `model.infer` as a per-view prior |
+
+The report is what makes the other two judgeable, so it always runs. It records
+the fitted scale, residual RMSE/median/P95, the inlier ratio against an absolute
+2 cm / 5 % tolerance, and an affine test `reference ~= a * model + b`. **A `b`
+well above the residual RMSE means the error is not a pure scale error and no
+single global scalar can fix the reconstruction** - the baseline estimator
+cannot detect this at all, because three camera-centre distances contain no
+information about scene depth.
+
+The depth-scaled mode refuses to export a scale it cannot defend: an implausible
+scale, fewer than 5000 co-visible pixels, or an inlier ratio below 0.5 all fall
+back to the baseline fit and record the rejected depth fit beside it.
+
+`--depth-input` and the report interact: depth fed to the model will of course
+agree with the model afterwards, so `summary.json` marks such a view
+`was_fed_to_model` and warns that the agreement is circular. Use
+`--depth-holdout` to keep a random subset of pixels out of the model, or judge
+the two hand views, which are never fed.
+
 ## Camera-pose contract
 
 For calibrated G1 captures, `camera_poses_opencv_cam2world.json` must provide all
