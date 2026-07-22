@@ -269,6 +269,55 @@ class PipelineGuiG2Test(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "resolved"):
                 MODULE.build_pipeline_commands(self.base_config(tmp, robot="auto"))
 
+    def test_optional_stages_are_not_part_of_the_core_pipeline(self):
+        """Selecting the whole core pipeline must not demand a URDF."""
+        self.assertNotIn("self_mask", MODULE.STAGES)
+        self.assertNotIn("diagnose", MODULE.STAGES)
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = dict(
+                MODULE.build_pipeline_commands(
+                    self.base_config(tmp, stages=MODULE.STAGES),
+                    python_executable="py",
+                    script_dir=Path("/pipeline"),
+                )
+            )
+            self.assertEqual(list(commands), list(MODULE.STAGES))
+
+    def test_self_mask_runs_between_undistort_and_inference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            order = [
+                name
+                for name, _ in MODULE.build_pipeline_commands(
+                    self.base_config(
+                        tmp, stages=MODULE.ALL_STAGES, urdf="/data/robot.urdf",
+                        self_mask_input=True,
+                    ),
+                    python_executable="py",
+                    script_dir=Path("/pipeline"),
+                )
+            ]
+            self.assertLess(order.index("undistort"), order.index("self_mask"))
+            self.assertLess(order.index("self_mask"), order.index("run_inference"))
+            self.assertEqual(order[-1], "diagnose")
+
+    def test_self_mask_stage_without_urdf_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "URDF"):
+                MODULE.build_pipeline_commands(
+                    self.base_config(tmp, stages=("self_mask",), urdf="")
+                )
+
+    def test_hiding_the_robot_reaches_inference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = dict(
+                MODULE.build_pipeline_commands(
+                    self.base_config(tmp, self_mask_input=True),
+                    python_executable="py",
+                    script_dir=Path("/pipeline"),
+                )
+            )
+            self.assertIn("--self-mask-input", commands["run_inference"])
+
     def test_invalid_holdout_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(ValueError, "holdout"):

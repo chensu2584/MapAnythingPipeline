@@ -133,6 +133,34 @@ def load_registered_depth(capture, undist_root=DEFAULT_UNDIST_ROOT):
     return result
 
 
+def load_self_occlusion_masks(capture, undist_root=DEFAULT_UNDIST_ROOT):
+    """Load Step A's robot self-occlusion masks, or an empty dict if absent.
+
+    Absent masks are normal: the capture may predate the mask stage, or the
+    robot may have no geometry in view.  Missing masks must not be an error.
+    """
+    path = Path(undist_root) / capture / "self_occlusion_mask.npz"
+    if not path.is_file():
+        return {}
+    result = {}
+    with np.load(path, allow_pickle=False) as data:
+        for key in data.files:
+            if key.endswith("_self_mask"):
+                result[key[: -len("_self_mask")]] = np.asarray(data[key], dtype=bool)
+    return result
+
+
+def resample_mask_to(mask, target_hw):
+    """Nearest-neighbour resample a boolean mask to ``target_hw``."""
+    target_h, target_w = (int(v) for v in target_hw)
+    height, width = mask.shape
+    if (height, width) == (target_h, target_w):
+        return mask
+    rows = np.clip((np.arange(target_h) + 0.5) * height / target_h, 0, height - 1).astype(int)
+    cols = np.clip((np.arange(target_w) + 0.5) * width / target_w, 0, width - 1).astype(int)
+    return mask[np.ix_(rows, cols)]
+
+
 def resample_depth_to(depth, valid, target_hw):
     """Nearest-neighbour resample a depth map and its validity to ``target_hw``.
 
@@ -157,6 +185,7 @@ def load_views(
     ignore_poses=False,
     depth_inputs=None,
     depth_holdout=0.0,
+    self_masks=None,
 ):
     cap_dir = Path(undist_root) / capture
 
@@ -188,6 +217,17 @@ def load_views(
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)  # HxWx3 uint8
         height, width = img_rgb.shape[:2]
         K = _load_adjusted_K(cap_dir / f"{name}_K.json", width, height)
+        if self_masks and name in self_masks:
+            robot_pixels = resample_mask_to(self_masks[name], img_rgb.shape[:2])
+            # Neutral grey rather than black: a black region reads as a dark
+            # surface, while grey carries no gradient for the network to latch
+            # onto.  The pixels are excluded from the output either way.
+            img_rgb = img_rgb.copy()
+            img_rgb[robot_pixels] = 128
+            print(
+                f"  self-mask input: {name} blanked {int(robot_pixels.sum())} px "
+                f"({100 * robot_pixels.mean():.1f}% of frame)"
+            )
         view = {
             "img": img_rgb.astype(np.uint8),
             "intrinsics": torch.from_numpy(K),
@@ -261,12 +301,23 @@ def run_capture(
     memory_efficient_inference=True,
     use_depth_input=False,
     depth_holdout=0.0,
+    use_self_mask_input=False,
 ):
     capture_started_at = time.perf_counter()
     timings = {}
     out_dir = os.path.join(output_root, capture)
     os.makedirs(out_dir, exist_ok=True)
     print(f"\n===== {capture} =====")
+
+    self_masks = load_self_occlusion_masks(capture, undist_root)
+    self_mask_report = {}
+    if self_masks:
+        print("  robot self-occlusion masks available for: " + ", ".join(sorted(self_masks)))
+    elif use_self_mask_input:
+        raise FileNotFoundError(
+            f"--self-mask-input was requested but {capture} has no self_occlusion_mask.npz; "
+            "run self_occlusion_mask.py first"
+        )
 
     registered_depth = load_registered_depth(capture, undist_root)
     if registered_depth:
@@ -288,6 +339,7 @@ def run_capture(
         ignore_poses=ignore_poses,
         depth_inputs=registered_depth if use_depth_input else None,
         depth_holdout=depth_holdout,
+        self_masks=self_masks if use_self_mask_input else None,
     )
     timings["input_load"] = time.perf_counter() - section_started_at
     _print_timing("input_load", timings["input_load"])
@@ -454,6 +506,7 @@ def run_capture(
         "camera_pose_used_for_export": pose_mode_labels[effective_pose_mode],
         "similarity_scale_correction": scale_metadata,
         "metric_depth_diagnostic": depth_diagnostic,
+        "self_occlusion_mask": self_mask_report or None,
         "pose_anchor": (
             {
                 "reference_view": VIEW_NAMES[0],
@@ -501,6 +554,19 @@ def run_capture(
 
         mask = pred["mask"][0].squeeze(-1).cpu().numpy().astype(bool)
         mask = mask & valid_mask.cpu().numpy()
+        # Drop the robot's own body from the output whether or not it was hidden
+        # from the model.  Blanking the input is an experiment; removing the
+        # robot from the exported cloud is always right, because those points
+        # are the robot, not the scene it has to avoid.
+        if self_masks and name in self_masks:
+            robot_pixels = resample_mask_to(self_masks[name], mask.shape)
+            removed = int((mask & robot_pixels).sum())
+            mask = mask & ~robot_pixels
+            self_mask_report[name] = {
+                "removed_points": removed,
+                "mask_coverage_fraction": float(robot_pixels.mean()),
+                "blanked_before_inference": bool(use_self_mask_input),
+            }
         pts3d_np = pts3d.cpu().numpy()
         image_np = pred["img_no_norm"][0].cpu().numpy()  # (H, W, 3) in [0, 1]
         depth_np = depthmap.cpu().numpy()
@@ -694,6 +760,7 @@ def run_capture(
         "pose_export_mode_effective": effective_pose_mode,
         "similarity_scale_correction": scale_metadata,
         "metric_depth_diagnostic": depth_diagnostic,
+        "self_occlusion_mask": self_mask_report or None,
         "anchor": summary["pose_anchor"],
         "poses": {
             name: export_pose_arrays[index].tolist()
@@ -766,6 +833,15 @@ def main():
             "Feed the registered metric depth to the model as a per-view depth_z "
             "prior instead of only using it afterwards. Requires a robot with a "
             "metric depth camera (G2)."
+        ),
+    )
+    parser.add_argument(
+        "--self-mask-input",
+        action="store_true",
+        help=(
+            "Blank the robot's own pixels before inference, to test whether the "
+            "gripper filling the wrist view distorts the estimate. Robot points "
+            "are removed from the exported cloud regardless of this flag."
         ),
     )
     parser.add_argument(
@@ -869,6 +945,7 @@ def main():
                 pose_export_mode=args.pose_export_mode,
                 use_depth_input=args.depth_input,
                 depth_holdout=args.depth_holdout,
+                use_self_mask_input=args.self_mask_input,
                 memory_efficient_inference=not args.fast_inference,
                 **filter_kwargs,
             )
@@ -889,6 +966,7 @@ def main():
                 pose_export_mode=args.pose_export_mode,
                 use_depth_input=args.depth_input,
                 depth_holdout=args.depth_holdout,
+                use_self_mask_input=args.self_mask_input,
                 memory_efficient_inference=True,
                 **filter_kwargs,
             )
