@@ -506,7 +506,9 @@ def run_capture(
         "camera_pose_used_for_export": pose_mode_labels[effective_pose_mode],
         "similarity_scale_correction": scale_metadata,
         "metric_depth_diagnostic": depth_diagnostic,
-        "self_occlusion_mask": self_mask_report or None,
+        # Bound by reference, not frozen: this dict is filled during the
+        # per-view loop below, after the first summary block is built.
+        "self_occlusion_mask": self_mask_report,
         "pose_anchor": (
             {
                 "reference_view": VIEW_NAMES[0],
@@ -760,7 +762,9 @@ def run_capture(
         "pose_export_mode_effective": effective_pose_mode,
         "similarity_scale_correction": scale_metadata,
         "metric_depth_diagnostic": depth_diagnostic,
-        "self_occlusion_mask": self_mask_report or None,
+        # Bound by reference, not frozen: this dict is filled during the
+        # per-view loop below, after the first summary block is built.
+        "self_occlusion_mask": self_mask_report,
         "anchor": summary["pose_anchor"],
         "poses": {
             name: export_pose_arrays[index].tolist()
