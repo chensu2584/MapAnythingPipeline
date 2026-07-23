@@ -108,6 +108,31 @@ def _load_adjusted_K(path, image_width, image_height):
     return K
 
 
+def resolve_view_max_depth(pairs):
+    """Parse ``view=meters`` caps into ``{view: meters}``, defaulting to none.
+
+    The cap is the camera-frame Z-depth beyond which a view's geometry is
+    dropped.  It exists because the hand cameras share a ~0.4 m baseline with the
+    head, so their triangulation weakens with range: on real data the hand_right
+    lateral error tracked viewing distance at r=0.95, from 14 mm near 1.1 m to
+    65 mm past 1.6 m, while the near points were the most accurate of any view.
+    Capping keeps each hand camera to the range where it is trustworthy and
+    leaves the far scene to the head.
+    """
+    result = {}
+    for item in pairs or []:
+        if "=" not in item:
+            raise ValueError(f"--view-max-depth wants view=meters, got {item!r}")
+        view, _, value = item.partition("=")
+        if view not in VIEW_NAMES:
+            raise ValueError(f"Unknown view {view!r}; expected one of {VIEW_NAMES}")
+        depth = float(value)
+        if not depth > 0.0:
+            raise ValueError(f"--view-max-depth for {view} must be positive, got {depth}")
+        result[view] = depth
+    return result
+
+
 def resolve_view_order(spec):
     """Return the order views are fed to the model, defaulting to VIEW_NAMES.
 
@@ -369,6 +394,7 @@ def run_capture(
     depth_holdout=0.0,
     use_self_mask_input=False,
     view_order=None,
+    view_max_depth=None,
 ):
     capture_started_at = time.perf_counter()
     timings = {}
@@ -378,6 +404,7 @@ def run_capture(
 
     self_masks = load_self_occlusion_masks(capture, undist_root)
     self_mask_report = {}
+    depth_cap_report = {}
     if self_masks:
         print("  robot self-occlusion masks available for: " + ", ".join(sorted(self_masks)))
     elif use_self_mask_input:
@@ -574,6 +601,8 @@ def run_capture(
         "preprocess_validation": preprocess_report,
         "memory_efficient_inference": bool(memory_efficient_inference),
         "view_order": list(view_order),
+        "view_max_depth_m": {k: float(v) for k, v in (view_max_depth or {}).items()},
+        "view_depth_cap": depth_cap_report,
         "pose_export_mode_requested": pose_export_mode,
         "pose_export_mode_effective": effective_pose_mode,
         "camera_pose_used_for_export": pose_mode_labels[effective_pose_mode],
@@ -649,6 +678,20 @@ def run_capture(
         pts3d_np = pts3d.cpu().numpy()
         image_np = pred["img_no_norm"][0].cpu().numpy()  # (H, W, 3) in [0, 1]
         depth_np = depthmap.cpu().numpy()
+        cap = (view_max_depth or {}).get(name)
+        if cap is not None:
+            # Drop this camera's geometry beyond its trustworthy range. pts3d and
+            # depth_z are still written in full, so the cap is recoverable; only
+            # the exported mask excludes the far points.
+            too_far = depth_np > cap
+            dropped = int((mask & too_far).sum())
+            mask = mask & ~too_far
+            depth_cap_report[name] = {
+                "max_depth_m": float(cap),
+                "dropped_points": dropped,
+                "kept_points": int(mask.sum()),
+            }
+            print(f"  depth cap: {name} <= {cap:.2f} m dropped {dropped} points")
         conf_np = pred["conf"][0].squeeze(-1).cpu().numpy() if "conf" in pred else None
         K_np = intrinsics.cpu().numpy()
         pose_np = cam_pose.cpu().numpy()
@@ -841,6 +884,8 @@ def run_capture(
             "meter" if pose_contract is not None else "arbitrary_model_scale"
         ),
         "view_order": list(view_order),
+        "view_max_depth_m": {k: float(v) for k, v in (view_max_depth or {}).items()},
+        "view_depth_cap": depth_cap_report,
         "pose_export_mode_requested": pose_export_mode,
         "pose_export_mode_effective": effective_pose_mode,
         "similarity_scale_correction": scale_metadata,
@@ -936,6 +981,19 @@ def main():
         ),
     )
     parser.add_argument(
+        "--view-max-depth",
+        action="append",
+        default=None,
+        metavar="VIEW=METERS",
+        help=(
+            "Cap a view's usable camera-frame depth, dropping geometry beyond it. "
+            "The hand cameras share a short baseline with the head, so they are "
+            "only trustworthy up close; e.g. --view-max-depth hand_left=1.5 "
+            "--view-max-depth hand_right=1.5 keeps them to 1.5 m and leaves the "
+            "far scene to the head."
+        ),
+    )
+    parser.add_argument(
         "--self-mask-input",
         action="store_true",
         help=(
@@ -991,6 +1049,7 @@ def main():
     )
     args = parser.parse_args()
     view_order = resolve_view_order(args.view_order)
+    view_max_depth = resolve_view_max_depth(args.view_max_depth)
     run_started_at = time.perf_counter()
     captures = resolve_captures(args.input_root, args.captures, preprocessed=True)
     filter_kwargs = dict(
@@ -1048,6 +1107,7 @@ def main():
                 depth_holdout=args.depth_holdout,
                 use_self_mask_input=args.self_mask_input,
                 view_order=view_order,
+                view_max_depth=view_max_depth,
                 memory_efficient_inference=not args.fast_inference,
                 **filter_kwargs,
             )
@@ -1070,6 +1130,7 @@ def main():
                 depth_holdout=args.depth_holdout,
                 use_self_mask_input=args.self_mask_input,
                 view_order=view_order,
+                view_max_depth=view_max_depth,
                 memory_efficient_inference=True,
                 **filter_kwargs,
             )

@@ -77,6 +77,7 @@ class PipelineConfig:
     mask_dilate_px: int = 12
     mask_gripper_shrink: float = 0.7
     swap_wrist_views: bool = False
+    hand_max_depth_m: float | None = 1.5
 
 
 def format_duration(seconds: float) -> str:
@@ -160,6 +161,8 @@ def build_pipeline_commands(
         raise ValueError("Depth holdout must be in [0, 1)")
     if not 0.0 < config.mask_gripper_shrink <= 1.0:
         raise ValueError("Gripper shrink must be in (0, 1]")
+    if config.hand_max_depth_m is not None and config.hand_max_depth_m <= 0.0:
+        raise ValueError("Hand-camera max depth must be positive when set")
 
     py = str(python_executable)
     data_root = str(config.data_root.expanduser().resolve())
@@ -239,6 +242,11 @@ def build_pipeline_commands(
             # Feed the wrist views in the opposite order. Outputs stay keyed by
             # name; only the index each camera occupies changes.
             command.extend(("--view-order", "head,hand_right,hand_left"))
+        if config.hand_max_depth_m is not None:
+            # The hand cameras share a short baseline with the head, so their
+            # geometry is only trustworthy up close.
+            command.extend(("--view-max-depth", f"hand_left={config.hand_max_depth_m}"))
+            command.extend(("--view-max-depth", f"hand_right={config.hand_max_depth_m}"))
         result.append(("run_inference", command))
 
     if "filter_export" in config.stages:
@@ -329,6 +337,8 @@ class PipelineGui:
         self.mask_dilate_var = tk.StringVar(value="12")
         self.mask_shrink_var = tk.StringVar(value="0.7")
         self.swap_wrist_var = tk.BooleanVar(value=False)
+        self.hand_depth_cap_var = tk.BooleanVar(value=True)
+        self.hand_depth_m_var = tk.StringVar(value="1.5")
         self.status_var = tk.StringVar(value="Ready")
         self.elapsed_var = tk.StringVar(value="Elapsed: --:--:--")
         self.stage_vars = {
@@ -602,6 +612,16 @@ class PipelineGui:
             text="Swap the two wrist views (is the worst view worst by camera, or by index?)",
             variable=self.swap_wrist_var,
         ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        hand_depth_row = ttk.Frame(options)
+        hand_depth_row.grid(row=15, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        ttk.Checkbutton(
+            hand_depth_row,
+            text="Cap hand-camera usable depth (m)",
+            variable=self.hand_depth_cap_var,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Entry(hand_depth_row, textvariable=self.hand_depth_m_var, width=6).grid(
+            row=0, column=1, sticky="w", padx=(8, 0)
+        )
 
         holdout_row = ttk.Frame(options)
         holdout_row.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(4, 0))
@@ -786,6 +806,11 @@ class PipelineGui:
             mask_dilate_px=int(self.mask_dilate_var.get() or 12),
             mask_gripper_shrink=float(self.mask_shrink_var.get() or 1.0),
             swap_wrist_views=self.swap_wrist_var.get(),
+            hand_max_depth_m=(
+                float(self.hand_depth_m_var.get() or 1.5)
+                if self.hand_depth_cap_var.get()
+                else None
+            ),
         )
 
     def start(self) -> None:

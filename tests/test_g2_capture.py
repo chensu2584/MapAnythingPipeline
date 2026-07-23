@@ -358,6 +358,31 @@ class MaskReprojectionTests(unittest.TestCase):
         self.assertTrue(out[20, 20])
 
 
+class ViewMaxDepthTests(unittest.TestCase):
+    @staticmethod
+    def resolve(pairs):
+        source = (Path(__file__).resolve().parents[1] / "run_inference.py").read_text()
+        start = source.index("def resolve_view_max_depth")
+        end = source.index("def resolve_view_order")
+        namespace = {"VIEW_NAMES": ("head", "hand_left", "hand_right")}
+        exec(source[start:end], namespace)  # noqa: S102 - isolated helper
+        return namespace["resolve_view_max_depth"](pairs)
+
+    def test_none_means_no_cap(self):
+        self.assertEqual(self.resolve(None), {})
+
+    def test_parses_per_view_caps(self):
+        self.assertEqual(
+            self.resolve(["hand_left=1.5", "hand_right=1.5"]),
+            {"hand_left": 1.5, "hand_right": 1.5},
+        )
+
+    def test_rejects_unknown_view_and_bad_value(self):
+        for bad in (["nope"], ["ghost=1.0"], ["head=-1"], ["head=0"]):
+            with self.assertRaises(ValueError):
+                self.resolve(bad)
+
+
 class ViewOrderTests(unittest.TestCase):
     """View 0 anchors the export, so only the wrist views may be reordered."""
 

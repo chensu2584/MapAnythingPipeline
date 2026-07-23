@@ -201,6 +201,21 @@ the arm moves. Draw the mask once on the undistorted image and pass it with
 `--static-mask hand_right=mask.png`; it stays exact for every capture from that
 camera and survives changing the end effector.
 
+### Capping hand-camera range
+
+The hand cameras share a ~0.4 m baseline with the head, so their triangulation
+weakens with distance. On real data the hand_right lateral error tracked viewing
+distance at r=0.95 — 14 mm near 1.1 m, 65 mm past 1.6 m — while its near points
+were the most accurate of any view. Beyond about 1.5 m a hand camera adds error,
+not information.
+
+`--view-max-depth hand_left=1.5 --view-max-depth hand_right=1.5` drops each hand
+camera's geometry beyond that camera-frame Z-depth, keeping its trustworthy near
+range and leaving the far scene to the head. The cap is baked into that view's
+mask in `views.npz`, so `filter_export`, `voxelize` and `scene.ply` all inherit
+it; `pts3d` and `depth_z` are still written in full, so it is recoverable. The
+GUI turns it on by default at 1.5 m.
+
 ### Which view is worst, and why
 
 One wrist view is consistently the worst on both G1 and G2. Two explanations fit

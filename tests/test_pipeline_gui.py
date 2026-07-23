@@ -334,6 +334,30 @@ class PipelineGuiG2Test(unittest.TestCase):
                     order = command[command.index("--view-order") + 1]
                     self.assertEqual(order, "head,hand_right,hand_left")
 
+    def test_hand_depth_cap_reaches_inference_for_both_wrist_views(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = dict(
+                MODULE.build_pipeline_commands(
+                    self.base_config(tmp, hand_max_depth_m=1.5),
+                    python_executable="py",
+                    script_dir=Path("/pipeline"),
+                )
+            )
+            command = commands["run_inference"]
+            caps = [command[i + 1] for i, x in enumerate(command) if x == "--view-max-depth"]
+            self.assertEqual(sorted(caps), ["hand_left=1.5", "hand_right=1.5"])
+
+    def test_hand_depth_cap_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = dict(
+                MODULE.build_pipeline_commands(
+                    self.base_config(tmp, hand_max_depth_m=None),
+                    python_executable="py",
+                    script_dir=Path("/pipeline"),
+                )
+            )
+            self.assertNotIn("--view-max-depth", commands["run_inference"])
+
     def test_invalid_holdout_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(ValueError, "holdout"):
