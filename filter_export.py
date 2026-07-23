@@ -52,7 +52,7 @@ from mapanything.utils.geometry import depthmap_to_world_frame
 from mapanything.utils.cropping import crop_resize_if_necessary
 from mapanything.utils.viz import predictions_to_glb
 
-from capture_contract import VIEW_NAMES, resolve_reconstruction_captures
+from capture_contract import VIEW_NAMES, present_views, resolve_reconstruction_captures
 from gripper_pose import (
     DEFAULT_G1_URDF,
     DEFAULT_GRIPPER_URDF,
@@ -166,12 +166,16 @@ def gripper_frame_mesh(pose, axis_length=DEFAULT_GRIPPER_AXIS_LENGTH_M):
     return frame
 
 
-def view_debug_images(images):
-    """Return per-view solid colors: head red, left green, right blue."""
+def view_debug_images(images, view_names=VIEW_NAMES):
+    """Return per-view solid colors: head red, left green, right blue.
+
+    ``view_names`` must match the views stacked into ``images`` in order, which
+    is a subset of VIEW_NAMES when the reconstruction used fewer cameras.
+    """
     return np.stack(
         [
             np.broadcast_to(VIEW_DEBUG_COLORS[name], images[view_idx].shape)
-            for view_idx, name in enumerate(VIEW_NAMES)
+            for view_idx, name in enumerate(view_names)
         ],
         axis=0,
     )
@@ -205,7 +209,7 @@ def build_glb_scene(
     # geometry added afterwards must carry the same transform itself.
     flip_x = trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0])
     if show_cameras:
-        for name in VIEW_NAMES:
+        for name in present_views(npz):
             camera_pose = npz[f"{name}_camera_pose"].astype(np.float64)
             camera_intrinsics = (
                 npz[f"{name}_intrinsics"].astype(np.float64)
@@ -444,10 +448,11 @@ def process_capture(
     npz = np.load(npz_path)
     print(f"\n===== {capture} =====")
 
+    views_present = present_views(npz)
     pts_list, img_list, mask_list, conf_list = [], [], [], []
-    have_conf = all(f"{n}_conf" in npz for n in VIEW_NAMES)
+    have_conf = all(f"{n}_conf" in npz for n in views_present)
 
-    for name in VIEW_NAMES:
+    for name in views_present:
         mask = npz[f"{name}_mask"].astype(bool)
 
         # Geometry: unproject from depth, verify against stored pts3d if present.
@@ -604,7 +609,7 @@ def process_capture(
     if color_by_view:
         by_view_glb = build_glb_scene(
             world_points,
-            view_debug_images(images),
+            view_debug_images(images, views_present),
             final_masks,
             npz,
             show_cameras=show_cameras,
@@ -620,7 +625,7 @@ def process_capture(
     if per_camera_k_ab:
         predicted_intrinsics = {
             name: npz[f"{name}_intrinsics"].astype(np.float32)
-            for name in VIEW_NAMES
+            for name in views_present
         }
         calibrated_intrinsics = {
             name: load_preprocessed_calibrated_intrinsics(
@@ -629,7 +634,7 @@ def process_capture(
                 npz[f"{name}_mask"].shape,
                 undist_root,
             )
-            for name in VIEW_NAMES
+            for name in views_present
         }
         selected_intrinsics = select_per_camera_k(
             predicted_intrinsics, calibrated_intrinsics
@@ -643,7 +648,7 @@ def process_capture(
                         npz, name, selected_intrinsics[name]
                     )[0].astype(np.float32)
                 )
-                for view_idx, name in enumerate(VIEW_NAMES)
+                for view_idx, name in enumerate(views_present)
             ],
             axis=0,
         )
@@ -677,7 +682,7 @@ def process_capture(
         if color_by_view:
             per_camera_by_view_scene = build_glb_scene(
                 per_camera_points,
-                view_debug_images(images),
+                view_debug_images(images, views_present),
                 per_camera_masks,
                 npz,
                 show_cameras=show_cameras,

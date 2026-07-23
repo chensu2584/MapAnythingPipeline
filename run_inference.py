@@ -919,6 +919,7 @@ def run_capture(
 
     # NPZ
     section_started_at = time.perf_counter()
+    npz["view_names"] = np.asarray(used_in_declared_order)
     npz_path = os.path.join(out_dir, "views.npz")
     np.savez_compressed(npz_path, **npz)
     timings["views_npz_write"] = time.perf_counter() - section_started_at

@@ -29,6 +29,20 @@ SUPPORTED_POSE_CONVENTIONS = {
 }
 
 
+def present_views(npz) -> list[str]:
+    """Return the views actually stored in a views.npz, in canonical order.
+
+    A reconstruction from a subset of cameras (``--view-order head,hand_left``)
+    writes only those views' arrays, so consumers must ask which views are
+    present rather than assuming all of VIEW_NAMES.  Order follows VIEW_NAMES so
+    stacked arrays stay in the declared, reproducible sequence.
+    """
+    views = [name for name in VIEW_NAMES if f"{name}_pts3d" in npz]
+    if not views:
+        raise ValueError("views.npz contains no recognised view arrays")
+    return views
+
+
 def _read_json(path: Path) -> dict:
     try:
         with path.open(encoding="utf-8") as f:

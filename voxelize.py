@@ -47,7 +47,7 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
-from capture_contract import VIEW_NAMES, resolve_reconstruction_captures
+from capture_contract import VIEW_NAMES, present_views, resolve_reconstruction_captures
 from gripper_pose import (
     DEFAULT_G1_URDF,
     DEFAULT_GRIPPER_URDF,
@@ -116,17 +116,21 @@ def load_points(capture, output_root=DEFAULT_OUTPUT_ROOT):
     """Merged filtered-input point cloud from views.npz.
     Returns (pts (N,3) f32, cols (N,3) f32 in [0,1], conf (N,) f32 or None)."""
     npz = np.load(os.path.join(output_root, capture, "views.npz"))
+    views_present = present_views(npz)
     pts_list, col_list, conf_list, view_list = [], [], [], []
-    have_conf = all(f"{n}_conf" in npz for n in VIEW_NAMES)
-    for index, name in enumerate(VIEW_NAMES):
+    have_conf = all(f"{n}_conf" in npz for n in views_present)
+    for name in views_present:
         mask = npz[f"{name}_mask"].astype(bool)
         pts_list.append(npz[f"{name}_pts3d"][mask])
         col_list.append(npz[f"{name}_img"][mask].astype(np.float32) / 255.0)
         # Remember which camera saw each point.  Which views agree on a voxel is
         # a strong self-filter cue: gripper surfaces are typically seen only by
         # the wrist camera on the same arm, while real scene geometry near the
-        # hand is also seen from the head.
-        view_list.append(np.full(int(mask.sum()), 1 << index, dtype=np.uint8))
+        # hand is also seen from the head.  The bit is the view's index in
+        # VIEW_NAMES so it means the same camera regardless of which subset ran.
+        view_list.append(
+            np.full(int(mask.sum()), 1 << VIEW_NAMES.index(name), dtype=np.uint8)
+        )
         if have_conf:
             conf_list.append(npz[f"{name}_conf"][mask])
     pts = np.concatenate(pts_list, axis=0).astype(np.float32)

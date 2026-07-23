@@ -77,5 +77,17 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(discover_raw_captures(root), ["complete"])
 
 
+
+class PresentViewsTests(unittest.TestCase):
+    def test_full_and_subset_and_empty(self):
+        from capture_contract import present_views, VIEW_NAMES
+
+        full = {f"{n}_pts3d": 1 for n in VIEW_NAMES}
+        self.assertEqual(present_views(full), list(VIEW_NAMES))
+        subset = {"head_pts3d": 1, "hand_left_pts3d": 1}
+        self.assertEqual(present_views(subset), ["head", "hand_left"])
+        with self.assertRaises(ValueError):
+            present_views({"nothing": 1})
+
 if __name__ == "__main__":
     unittest.main()

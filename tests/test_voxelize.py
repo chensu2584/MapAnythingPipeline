@@ -98,6 +98,17 @@ class VoxelSourceViewTests(unittest.TestCase):
                 np.zeros(7, np.uint8),
             )
 
+    def test_subset_reconstruction_voxelizes(self):
+        """A views.npz from head,hand_left only must not fail on missing hand_right."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_capture(root, {"head": (0.0, 0.5), "hand_left": (0.3, 0.8)})
+            voxelize.process_capture("cap", voxel_size=0.1, output_root=str(root))
+            with np.load(root / "cap" / "voxels.npz") as data:
+                # Only head (bit0) and hand_left (bit1) may appear, never bit2.
+                self.assertFalse((data["source_views"] & 0b100).any())
+                self.assertTrue((data["source_views"] & 0b011).any())
+
     def test_frame_is_declared_only_when_known(self):
         """An "unknown" placeholder would stop consumers falling back to the
         pose document that does know the frame."""
