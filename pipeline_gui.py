@@ -78,6 +78,8 @@ class PipelineConfig:
     mask_gripper_shrink: float = 0.7
     swap_wrist_views: bool = False
     hand_max_depth_m: float | None = 1.5
+    view_subset: str = ""          # experiment A: e.g. "head,hand_right"; empty = all
+    roll_normalize: bool = False   # experiment B
 
 
 def format_duration(seconds: float) -> str:
@@ -163,6 +165,11 @@ def build_pipeline_commands(
         raise ValueError("Gripper shrink must be in (0, 1]")
     if config.hand_max_depth_m is not None and config.hand_max_depth_m <= 0.0:
         raise ValueError("Hand-camera max depth must be positive when set")
+    if config.roll_normalize and (config.depth_input or config.self_mask_input):
+        raise ValueError(
+            "Roll-normalize cannot be combined with feed-depth or hide-robot: "
+            "those align pixels to the unrotated image."
+        )
 
     py = str(python_executable)
     data_root = str(config.data_root.expanduser().resolve())
@@ -238,10 +245,15 @@ def build_pipeline_commands(
                 command.extend(("--depth-holdout", str(config.depth_holdout)))
         if config.self_mask_input:
             command.append("--self-mask-input")
-        if config.swap_wrist_views:
+        if config.view_subset:
+            # Experiment A: reconstruct from a subset (e.g. head,hand_right).
+            command.extend(("--view-order", config.view_subset))
+        elif config.swap_wrist_views:
             # Feed the wrist views in the opposite order. Outputs stay keyed by
             # name; only the index each camera occupies changes.
             command.extend(("--view-order", "head,hand_right,hand_left"))
+        if config.roll_normalize:
+            command.append("--roll-normalize")
         if config.hand_max_depth_m is not None:
             # The hand cameras share a short baseline with the head, so their
             # geometry is only trustworthy up close.
@@ -354,6 +366,8 @@ class PipelineGui:
         self.swap_wrist_var = tk.BooleanVar(value=False)
         self.hand_depth_cap_var = tk.BooleanVar(value=True)
         self.hand_depth_m_var = tk.StringVar(value="1.5")
+        self.view_subset_var = tk.StringVar(value="")
+        self.roll_normalize_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready")
         self.elapsed_var = tk.StringVar(value="Elapsed: --:--:--")
         self.stage_vars = {
@@ -643,6 +657,19 @@ class PipelineGui:
         ttk.Entry(hand_depth_row, textvariable=self.hand_depth_m_var, width=6).grid(
             row=0, column=1, sticky="w", padx=(8, 0)
         )
+        subset_row = ttk.Frame(options)
+        subset_row.grid(row=16, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        ttk.Label(subset_row, text="Views subset (exp A, e.g. head,hand_right)").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Entry(subset_row, textvariable=self.view_subset_var, width=22).grid(
+            row=0, column=1, sticky="w", padx=(8, 0)
+        )
+        ttk.Checkbutton(
+            options,
+            text="Roll-normalize wrist views to upright (exp B)",
+            variable=self.roll_normalize_var,
+        ).grid(row=17, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         holdout_row = ttk.Frame(options)
         holdout_row.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(4, 0))
@@ -827,6 +854,8 @@ class PipelineGui:
             mask_dilate_px=int(self.mask_dilate_var.get() or 12),
             mask_gripper_shrink=float(self.mask_shrink_var.get() or 1.0),
             swap_wrist_views=self.swap_wrist_var.get(),
+            view_subset=self.view_subset_var.get().strip(),
+            roll_normalize=self.roll_normalize_var.get(),
             hand_max_depth_m=(
                 float(self.hand_depth_m_var.get() or 1.5)
                 if self.hand_depth_cap_var.get()

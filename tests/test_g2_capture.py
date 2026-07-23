@@ -404,6 +404,14 @@ class ViewOrderTests(unittest.TestCase):
             ("head", "hand_right", "hand_left"),
         )
 
+    def test_subset_of_views_is_allowed(self):
+        self.assertEqual(self.resolve("head,hand_right"), ("head", "hand_right"))
+        self.assertEqual(self.resolve("head,hand_left"), ("head", "hand_left"))
+
+    def test_single_view_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "at least two"):
+            self.resolve("head")
+
     def test_moving_the_head_off_view_zero_is_refused(self):
         with self.assertRaisesRegex(ValueError, "View 0 must stay"):
             self.resolve("hand_left,head,hand_right")
@@ -431,10 +439,13 @@ class ViewOrderTests(unittest.TestCase):
                 exported, expected, err_msg=f"feed order {feed} leaked into the export"
             )
 
-    def test_a_non_permutation_is_refused(self):
-        for bad in ("head,hand_left", "head,hand_left,hand_left", "head,hand_left,nope"):
-            with self.assertRaisesRegex(ValueError, "permutation"):
-                self.resolve(bad)
+    def test_duplicate_views_are_refused(self):
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            self.resolve("head,hand_left,hand_left")
+
+    def test_unknown_views_are_refused(self):
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            self.resolve("head,hand_left,nope")
 
 
 if __name__ == "__main__":

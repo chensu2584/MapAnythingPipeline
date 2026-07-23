@@ -15,6 +15,7 @@ For each capture:
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -134,25 +135,31 @@ def resolve_view_max_depth(pairs):
 
 
 def resolve_view_order(spec):
-    """Return the order views are fed to the model, defaulting to VIEW_NAMES.
+    """Return which views are fed to the model and in what order.
 
-    Only the order changes; every output stays keyed by view name, so nothing
-    downstream has to know. View 0 stays the head because the export anchors the
-    calibrated head pose and fits scale relative to it.
+    Defaults to all of ``VIEW_NAMES``.  ``spec`` may be a permutation (to reorder)
+    or a strict subset (to reconstruct from fewer cameras); either way every
+    output stays keyed by view name, so downstream code does not care.  View 0
+    must stay the head because the export anchors that camera's calibrated pose
+    and fits scale relative to it, and at least two views are required for a
+    multi-view reconstruction.
 
-    Reordering exists to separate two explanations for one view always being the
-    worst: the physical camera's geometry, or its index. MapAnything makes all
-    poses relative to view 0, so the last view is not interchangeable with the
-    first by construction. If the error follows the index after a swap it is an
-    algorithmic effect; if it follows the camera it is geometry.
+    Two experiments motivate this.  Reordering separates whether the worst view
+    is worst because of its camera or its index, since MapAnything makes all
+    poses relative to view 0.  A subset such as ``head,hand_right`` reconstructs
+    one hand against the head alone, isolating that camera's own quality from any
+    interaction with the other hand.
     """
     if not spec:
         return tuple(VIEW_NAMES)
     order = tuple(name.strip() for name in spec.split(",") if name.strip())
-    if sorted(order) != sorted(VIEW_NAMES):
-        raise ValueError(
-            f"--view-order must be a permutation of {VIEW_NAMES}, got {order}"
-        )
+    unknown = [name for name in order if name not in VIEW_NAMES]
+    if unknown:
+        raise ValueError(f"--view-order has unknown views {unknown}; expected {VIEW_NAMES}")
+    if len(set(order)) != len(order):
+        raise ValueError(f"--view-order has duplicate views: {order}")
+    if len(order) < 2:
+        raise ValueError(f"--view-order needs at least two views, got {order}")
     if order[0] != VIEW_NAMES[0]:
         raise ValueError(
             f"View 0 must stay {VIEW_NAMES[0]!r}: the export anchors that camera's "
@@ -201,6 +208,39 @@ def load_self_occlusion_masks(capture, undist_root=DEFAULT_UNDIST_ROOT):
             if key.endswith("_self_mask"):
                 result[key[: -len("_self_mask")]] = np.asarray(data[key], dtype=bool)
     return result
+
+
+def roll_normalize_upright(image, K, base_T_cam, gravity_base=(0.0, 0.0, -1.0)):
+    """Rotate a view about its optical axis so gravity points straight down.
+
+    MapAnything is trained mostly on gravity-aligned imagery, so a rolled camera
+    (the G2 right wrist sits ~20 deg off) may be reconstructed worse for that
+    reason alone.  This removes the roll as a controlled experiment: the image is
+    rotated about its principal point and the pose prior is rotated about the
+    same optical axis by the same angle, so image, intrinsics and pose stay
+    mutually consistent and the unprojected geometry is unchanged apart from what
+    the model itself does differently on an upright image.
+
+    A rotation about the optical axis leaves the camera centre and optical axis
+    fixed, so intrinsics (fx==fy here) and the baseline are untouched.  Returns
+    ``(rotated_image, K, rotated_pose, roll_degrees)``.
+    """
+    rotation = np.asarray(base_T_cam, dtype=np.float64)[:3, :3]
+    gravity_cam = rotation.T @ np.asarray(gravity_base, dtype=np.float64)
+    theta = float(np.arctan2(gravity_cam[0], gravity_cam[1]))  # image-plane roll
+    if abs(theta) < 1e-6:
+        return image, K, np.asarray(base_T_cam, dtype=np.float64), 0.0
+
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    matrix = cv2.getRotationMatrix2D((cx, cy), -math.degrees(theta), 1.0)
+    height, width = image.shape[:2]
+    rotated = cv2.warpAffine(image, matrix, (width, height), flags=cv2.INTER_LINEAR)
+
+    cos_t, sin_t = math.cos(-theta), math.sin(-theta)
+    roll = np.eye(4)
+    roll[:3, :3] = [[cos_t, -sin_t, 0.0], [sin_t, cos_t, 0.0], [0.0, 0.0, 1.0]]
+    pose_rot = np.asarray(base_T_cam, dtype=np.float64) @ roll
+    return rotated, K, pose_rot, math.degrees(theta)
 
 
 def resample_mask_to(mask, target_hw):
@@ -273,9 +313,11 @@ def load_views(
     depth_holdout=0.0,
     self_masks=None,
     view_order=None,
+    roll_normalize=False,
 ):
     view_order = tuple(view_order or VIEW_NAMES)
     cap_dir = Path(undist_root) / capture
+    roll_report = {}
 
     poses = None
     pose_contract = None
@@ -306,6 +348,16 @@ def load_views(
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)  # HxWx3 uint8
         height, width = img_rgb.shape[:2]
         K = _load_adjusted_K(cap_dir / f"{name}_K.json", width, height)
+        # Roll-normalize non-anchor views: the head is view 0 and stays as the
+        # world anchor, so only the wrist cameras are straightened.
+        if roll_normalize and poses is not None and name != view_order[0]:
+            img_rgb, K, rotated_pose, roll_deg = roll_normalize_upright(
+                img_rgb, K.astype(np.float64), np.asarray(poses[name], dtype=np.float64)
+            )
+            poses = {**poses, name: rotated_pose}
+            K = K.astype(np.float32)
+            roll_report[name] = round(float(roll_deg), 3)
+            print(f"  roll-normalize: {name} rotated {roll_deg:+.2f} deg to upright")
         if self_masks and name in self_masks:
             robot_pixels = resample_mask_to(self_masks[name], img_rgb.shape[:2])
             # Neutral grey rather than black: a black region reads as a dark
@@ -342,7 +394,7 @@ def load_views(
             )
         views.append(view)
         undistorted_intrinsics[name] = K.astype(np.float64)
-    return views, pose_contract, undistorted_intrinsics
+    return views, pose_contract, undistorted_intrinsics, roll_report
 
 
 def validate_preprocessed_views(raw_views, processed_views, view_order=None):
@@ -395,6 +447,7 @@ def run_capture(
     use_self_mask_input=False,
     view_order=None,
     view_max_depth=None,
+    roll_normalize=False,
 ):
     capture_started_at = time.perf_counter()
     timings = {}
@@ -415,7 +468,14 @@ def run_capture(
 
     view_order = tuple(view_order or VIEW_NAMES)
     if view_order != tuple(VIEW_NAMES):
-        print(f"  view order: {' -> '.join(view_order)} (default {' -> '.join(VIEW_NAMES)})")
+        print(f"  views: {' -> '.join(view_order)} (default {' -> '.join(VIEW_NAMES)})")
+    if roll_normalize and (use_depth_input or use_self_mask_input):
+        # Both feed per-pixel data aligned to the original image grid, which the
+        # roll rotation would misalign. Keep the experiment clean instead.
+        raise ValueError(
+            "--roll-normalize cannot be combined with --depth-input or "
+            "--self-mask-input: those align pixels to the unrotated image."
+        )
 
     registered_depth = load_registered_depth(capture, undist_root)
     if registered_depth:
@@ -430,7 +490,7 @@ def run_capture(
         )
 
     section_started_at = time.perf_counter()
-    views, pose_contract, undistorted_K = load_views(
+    views, pose_contract, undistorted_K, roll_report = load_views(
         capture,
         undist_root,
         allow_missing_poses,
@@ -439,6 +499,7 @@ def run_capture(
         depth_holdout=depth_holdout,
         self_masks=self_masks if use_self_mask_input else None,
         view_order=view_order,
+        roll_normalize=roll_normalize,
     )
     timings["input_load"] = time.perf_counter() - section_started_at
     _print_timing("input_load", timings["input_load"])
@@ -603,6 +664,7 @@ def run_capture(
         "view_order": list(view_order),
         "view_max_depth_m": {k: float(v) for k, v in (view_max_depth or {}).items()},
         "view_depth_cap": depth_cap_report,
+        "roll_normalized_deg": roll_report or None,
         "pose_export_mode_requested": pose_export_mode,
         "pose_export_mode_effective": effective_pose_mode,
         "camera_pose_used_for_export": pose_mode_labels[effective_pose_mode],
@@ -795,12 +857,13 @@ def run_capture(
     summary["baselines_m"] = baselines
     print(f"  baselines(m): {baselines}")
 
-    # Stack for GLB/PLY in the declared view order, never the feed order.  The
-    # order views are given to the model is an inference-time detail, but the
-    # exported point sequence is a contract: filter_export replays scene.ply
-    # point by point, so a reordered export silently compares each view against
-    # a different one.
-    canonical = [view_order.index(name) for name in VIEW_NAMES]
+    # Stack for GLB/PLY in the declared view order, never the feed order, and
+    # over only the views actually used.  The order views are given to the model
+    # is an inference-time detail, but the exported point sequence is a contract:
+    # filter_export replays scene.ply point by point, so a reordered export
+    # silently compares each view against a different one.
+    used_in_declared_order = [name for name in VIEW_NAMES if name in view_order]
+    canonical = [view_order.index(name) for name in used_in_declared_order]
     world_points = np.stack([world_points_list[i] for i in canonical], axis=0)
     images = np.stack([images_list[i] for i in canonical], axis=0)
     final_masks = np.stack([masks_list[i] for i in canonical], axis=0)
@@ -808,8 +871,8 @@ def run_capture(
     # Optional export filters (stackable); geometry in views.npz stays unfiltered.
     if any(f is not None for f in (max_radius, bbox, min_conf)):
         conf_stack = (
-            np.stack([npz[f"{n}_conf"] for n in VIEW_NAMES], axis=0)
-            if f"{VIEW_NAMES[0]}_conf" in npz
+            np.stack([npz[f"{n}_conf"] for n in used_in_declared_order], axis=0)
+            if f"{used_in_declared_order[0]}_conf" in npz
             else None
         )
         keep = build_filter_mask(
@@ -886,6 +949,7 @@ def run_capture(
         "view_order": list(view_order),
         "view_max_depth_m": {k: float(v) for k, v in (view_max_depth or {}).items()},
         "view_depth_cap": depth_cap_report,
+        "roll_normalized_deg": roll_report or None,
         "pose_export_mode_requested": pose_export_mode,
         "pose_export_mode_effective": effective_pose_mode,
         "similarity_scale_correction": scale_metadata,
@@ -970,14 +1034,14 @@ def main():
     parser.add_argument(
         "--view-order",
         default=None,
-        metavar="head,hand_x,hand_y",
+        metavar="head,hand_x[,hand_y]",
         help=(
-            "Order the views are fed to the model, as a permutation of "
-            f"{','.join(VIEW_NAMES)}. Outputs stay keyed by name. View 0 must "
-            "stay the head. Swapping the two wrist views separates whether the "
-            "consistently worst view is worst because of its camera geometry or "
-            "because of its index, since the model makes all poses relative to "
-            "view 0."
+            "Which views are fed to the model and in what order: a permutation of "
+            f"{','.join(VIEW_NAMES)} to reorder, or a subset (at least two, head "
+            "first) to reconstruct from fewer cameras. Outputs stay keyed by "
+            "name. Swapping the wrist views tells whether the worst view is worst "
+            "by camera or by index; a subset like head,hand_right isolates one "
+            "hand's quality against the head alone."
         ),
     )
     parser.add_argument(
@@ -991,6 +1055,17 @@ def main():
             "only trustworthy up close; e.g. --view-max-depth hand_left=1.5 "
             "--view-max-depth hand_right=1.5 keeps them to 1.5 m and leaves the "
             "far scene to the head."
+        ),
+    )
+    parser.add_argument(
+        "--roll-normalize",
+        action="store_true",
+        help=(
+            "Rotate each non-head view about its optical axis so gravity points "
+            "straight down before inference, testing whether MapAnything does "
+            "worse on rolled cameras (the G2 right wrist sits ~20 deg off). Pose "
+            "and intrinsics are rotated to match, so the exported geometry stays "
+            "comparable. Cannot be combined with --depth-input or --self-mask-input."
         ),
     )
     parser.add_argument(
@@ -1060,7 +1135,7 @@ def main():
         print(f"Validating captures: {', '.join(captures)}")
         for capture in captures:
             print(f"\n===== {capture} =====")
-            views, contract, _ = load_views(
+            views, contract, _, _ = load_views(
                 capture,
                 args.input_root,
                 args.allow_missing_poses,
@@ -1108,6 +1183,7 @@ def main():
                 use_self_mask_input=args.self_mask_input,
                 view_order=view_order,
                 view_max_depth=view_max_depth,
+                roll_normalize=args.roll_normalize,
                 memory_efficient_inference=not args.fast_inference,
                 **filter_kwargs,
             )
@@ -1131,6 +1207,7 @@ def main():
                 use_self_mask_input=args.self_mask_input,
                 view_order=view_order,
                 view_max_depth=view_max_depth,
+                roll_normalize=args.roll_normalize,
                 memory_efficient_inference=True,
                 **filter_kwargs,
             )

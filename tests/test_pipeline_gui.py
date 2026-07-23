@@ -358,6 +358,37 @@ class PipelineGuiG2Test(unittest.TestCase):
             )
             self.assertNotIn("--view-max-depth", commands["run_inference"])
 
+    def test_view_subset_reaches_inference_as_view_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = dict(
+                MODULE.build_pipeline_commands(
+                    self.base_config(tmp, view_subset="head,hand_right"),
+                    python_executable="py",
+                    script_dir=Path("/pipeline"),
+                )
+            )
+            command = commands["run_inference"]
+            self.assertIn("--view-order", command)
+            self.assertEqual(command[command.index("--view-order") + 1], "head,hand_right")
+
+    def test_roll_normalize_reaches_inference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = dict(
+                MODULE.build_pipeline_commands(
+                    self.base_config(tmp, roll_normalize=True),
+                    python_executable="py",
+                    script_dir=Path("/pipeline"),
+                )
+            )
+            self.assertIn("--roll-normalize", commands["run_inference"])
+
+    def test_roll_normalize_conflicts_with_depth_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "Roll-normalize"):
+                MODULE.build_pipeline_commands(
+                    self.base_config(tmp, roll_normalize=True, depth_input=True)
+                )
+
     def test_invalid_holdout_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(ValueError, "holdout"):
