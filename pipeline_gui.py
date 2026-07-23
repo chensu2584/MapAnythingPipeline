@@ -306,12 +306,27 @@ def build_pipeline_commands(
     return result
 
 
+def _ui_scale() -> float:
+    """Overall interface scale, from PIPELINE_GUI_SCALE (default 1.0).
+
+    One knob for fonts, widget padding, the tk scaling factor and the window
+    size, so a smaller display can shrink the whole GUI without editing code:
+    ``PIPELINE_GUI_SCALE=0.7 python pipeline_gui.py``.
+    """
+    try:
+        value = float(os.environ.get("PIPELINE_GUI_SCALE", "1.0"))
+    except ValueError:
+        return 1.0
+    return min(max(value, 0.4), 2.5)
+
+
 class PipelineGui:
     def __init__(self, root: tk.Tk):
         self.root = root
+        self.scale = _ui_scale()
         self.root.title("MapAnything Pipeline")
-        self.root.geometry("1360x920")
-        self.root.minsize(1100, 760)
+        self.root.geometry(f"{int(1360 * self.scale)}x{int(920 * self.scale)}")
+        self.root.minsize(int(1100 * self.scale), int(760 * self.scale))
         self._configure_style()
 
         project_root = SCRIPT_DIR.parent
@@ -365,7 +380,7 @@ class PipelineGui:
     def _configure_style(self) -> None:
         """Use explicit large fonts for both ttk and classic Tk widgets."""
 
-        self.root.tk.call("tk", "scaling", 1.45)
+        self.root.tk.call("tk", "scaling", 1.45 * self.scale)
         available = set(tkfont.families(self.root))
         family = next(
             (
@@ -381,9 +396,12 @@ class PipelineGui:
             str(tkfont.nametofont("TkDefaultFont").actual("family")),
         )
         mono_family = "DejaVu Sans Mono" if "DejaVu Sans Mono" in available else family
-        self.ui_font = (family, 16)
-        self.heading_font = (family, 17, "bold")
-        self.log_font = (mono_family, 14)
+        ui_size = max(int(round(16 * self.scale)), 7)
+        heading_size = max(int(round(17 * self.scale)), 8)
+        log_size = max(int(round(14 * self.scale)), 6)
+        self.ui_font = (family, ui_size)
+        self.heading_font = (family, heading_size, "bold")
+        self.log_font = (mono_family, log_size)
 
         for font_name in (
             "TkDefaultFont",
@@ -397,20 +415,23 @@ class PipelineGui:
         ):
             try:
                 named_font = tkfont.nametofont(font_name)
-                named_font.configure(family=family, size=16)
+                named_font.configure(family=family, size=ui_size)
             except tk.TclError:
                 pass
         self.root.option_add("*Font", self.ui_font)
+
+        def pad(x, y):
+            return (int(round(x * self.scale)), int(round(y * self.scale)))
 
         style = ttk.Style(self.root)
         if "clam" in style.theme_names():
             style.theme_use("clam")
         style.configure(".", font=self.ui_font)
         style.configure("TLabelframe.Label", font=self.heading_font)
-        style.configure("TButton", font=self.ui_font, padding=(14, 10))
-        style.configure("TCheckbutton", font=self.ui_font, padding=(5, 5))
-        style.configure("TEntry", font=self.ui_font, padding=(6, 7))
-        style.configure("TCombobox", font=self.ui_font, padding=(6, 7))
+        style.configure("TButton", font=self.ui_font, padding=pad(14, 10))
+        style.configure("TCheckbutton", font=self.ui_font, padding=pad(5, 5))
+        style.configure("TEntry", font=self.ui_font, padding=pad(6, 7))
+        style.configure("TCombobox", font=self.ui_font, padding=pad(6, 7))
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
