@@ -21,11 +21,16 @@ class UndistortCacheTests(unittest.TestCase):
     def make_complete_output(self, root: Path, cache: dict) -> Path:
         output = root / "undistorted" / "capture"
         output.mkdir(parents=True)
+        written = []
         for name in IMAGE_TO_INTRINSIC:
             (output / f"{name}.png").write_bytes(b"undistorted")
             (output / f"{name}_K.json").write_text("{}", encoding="utf-8")
+            written.extend([f"{name}.png", f"{name}_K.json"])
         (output / "pipeline_preprocess_manifest.json").write_text(
-            json.dumps({"schema_version": 2, "cache": cache}), encoding="utf-8"
+            json.dumps(
+                {"schema_version": 3, "cache": cache, "written_outputs": sorted(written)}
+            ),
+            encoding="utf-8",
         )
         return output
 

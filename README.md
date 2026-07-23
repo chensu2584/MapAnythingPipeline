@@ -134,6 +134,119 @@ Image preprocessing remains enabled: pose/intrinsic preservation checks and edge
 masking affect reconstruction validity and are not removed for speed. The GUI sends
 all selected captures to one inference process, so model weights load once per batch.
 
+## G2 support
+
+`--robot g2` (or auto-detection from the folder layout) reads a G2 capture
+session of `snapshot_*` folders instead of the flat G1 capture layout:
+
+```
+session_.../snapshot_.../
+    head_rgb.png  hand_left_rgb.png  hand_right_rgb.png   (three colour views)
+    head_depth_raw16.png                                  (uint16 millimetres)
+    camera_extrinsics.json                                (intrinsics + base_T_camera + joints)
+```
+
+G2 already ships metric `base_T_camera` matrices in OpenCV RDF, so no forward
+kinematics has to be re-derived. Step A validates them (SO(3), the redundant
+quaternion/inverse/translation copies, camera synchronisation, the capture
+script's own FK-vs-SDK check) and then rewrites them into the same
+`camera_poses_opencv_cam2world.json` every later stage already consumes. Steps
+B-D therefore do not need to know which robot produced the capture.
+
+```bash
+# Step A: undistort + register depth into the undistorted colour frame
+python undistort.py --robot g2 \
+    --data-root /path/to/session_20260721_232012 \
+    --output-root /path/to/outputs
+
+# Step B: inference, with the metric depth used only as a quality report
+python run_inference.py --captures snapshot_20260721_232128_0001
+
+# Step B, version 1: let the measured depth set the reconstruction scale
+python run_inference.py --captures snapshot_20260721_232128_0001 \
+    --pose-export-mode model-relative-head-anchored-depth-scaled
+
+# Step B, version 2: feed the depth to the model as a fourth input modality,
+# withholding 30 percent of pixels so the diagnostic stays honest
+python run_inference.py --captures snapshot_20260721_232128_0001 \
+    --depth-input --depth-holdout 0.3
+```
+
+### Robot self-occlusion masks
+
+`self_occlusion_mask.py` projects the robot's collision geometry through forward
+kinematics into each camera. Robot points are dropped from the exported cloud
+whenever a mask exists; `--self-mask-input` additionally blanks those pixels
+before inference.
+
+**Measured result: blanking makes the reconstruction worse on every view.** The
+gripper pixels are near-field structure the network anchors on, not noise, and a
+large flat grey region is itself a misleading signal. Use the mask to clean the
+output, not the input.
+
+G2's gripper collision mesh is a *swept volume* covering the full open/close
+travel, so at wrist-camera range it masks about a third of the frame — far more
+than the gripper occupies, and being solid it also fills the gaps the real open
+gripper is seen through. `--shrink-links gripper=0.7` scales matching links about
+their own centroid and recovers much of the wrongly-masked scene, but cannot
+recover what the solid envelope fills in.
+
+**Do not assume the URDF describes the installed end effector.** On this robot it
+places each wrist camera at the flange origin, which the measured calibration
+puts 10 cm away, so at least that part of the description is a placeholder.
+
+The reliable alternative needs no model at all: a gripper is rigid with respect
+to its own wrist camera, so it occupies the same pixels in every frame however
+the arm moves. Draw the mask once on the undistorted image and pass it with
+`--static-mask hand_right=mask.png`; it stays exact for every capture from that
+camera and survives changing the end effector.
+
+### Which view is worst, and why
+
+One wrist view is consistently the worst on both G1 and G2. Two explanations fit
+equally: that camera's geometry (on G2 its optical axis sits 39-42 degrees off
+the head's, against 26-28 for the other wrist), or its index, since MapAnything
+makes every pose relative to view 0 and the last view is not interchangeable
+with the first by construction.
+
+`--view-order head,hand_right,hand_left` swaps the two wrist views. Outputs stay
+keyed by name; only the index each camera occupies changes, and view 0 must stay
+the head because the export anchors that camera's calibrated pose. Run it, then
+compare the `lateral` column from `diagnose_reconstruction.py`:
+
+- the error follows the **index** (the new third view degrades) — algorithmic,
+  and calibration will not fix it
+- the error follows the **camera** (still `hand_right`) — geometry
+
+### Metric depth: report, scale anchor, or model input
+
+The head depth camera is metric, so it can play three different roles. They are
+independent and can be combined:
+
+| Role | Flag | What it does |
+|---|---|---|
+| Quality report | *(always on when depth exists)* | Fits predicted vs measured head depth and writes the result to `summary.json`; does not change the reconstruction |
+| Scale anchor | `--pose-export-mode ...-depth-scaled` | Uses that fit as the similarity scale instead of the three camera baselines |
+| Model input | `--depth-input` | Passes `depth_z` + `is_metric_scale` into `model.infer` as a per-view prior |
+
+The report is what makes the other two judgeable, so it always runs. It records
+the fitted scale, residual RMSE/median/P95, the inlier ratio against an absolute
+2 cm / 5 % tolerance, and an affine test `reference ~= a * model + b`. **A `b`
+well above the residual RMSE means the error is not a pure scale error and no
+single global scalar can fix the reconstruction** - the baseline estimator
+cannot detect this at all, because three camera-centre distances contain no
+information about scene depth.
+
+The depth-scaled mode refuses to export a scale it cannot defend: an implausible
+scale, fewer than 5000 co-visible pixels, or an inlier ratio below 0.5 all fall
+back to the baseline fit and record the rejected depth fit beside it.
+
+`--depth-input` and the report interact: depth fed to the model will of course
+agree with the model afterwards, so `summary.json` marks such a view
+`was_fed_to_model` and warns that the agreement is circular. Use
+`--depth-holdout` to keep a random subset of pixels out of the model, or judge
+the two hand views, which are never fed.
+
 ## Camera-pose contract
 
 For calibrated G1 captures, `camera_poses_opencv_cam2world.json` must provide all
@@ -257,8 +370,27 @@ Bins the merged world-frame point cloud from `views.npz` into a fixed-resolution
 - `voxels.npz` — sparse grid: `indices (N,3) int32`, `origin (3,)`, `voxel_size`, `dims (3,)`, `counts`, `colors (N,3) uint8`, `conf`, plus `labels`/`label_scores` reserved as zeros for Task 2 (semantic lift)
 - `voxels.glb` — colored cube per occupied voxel, viewable alongside `scene.glb`
 
+## Diagnosis
+
+`diagnose_reconstruction.py` compares each view against the metric depth camera
+along shared rays and reports what `summary.json` cannot: a per-view range
+ratio, an affine test exposing a constant offset, and a radial/lateral split
+saying whether the error is a depth problem a metric prior can fix or a pose
+problem it cannot.
+
+```bash
+python diagnose_reconstruction.py --session <session> --output-root <out> --planes
+```
+
+`--planes` also characterises the depth camera itself on surfaces known to be
+flat, so its own noise and mounting tilt sit beside the numbers rather than
+being treated as truth.
+
 ## Docs
 
 - `PROJECT_LOG.md` — running project log
+- `G2_FINDINGS_20260722.md` — G2 reconstruction quality investigation: measured
+  error shape, four experiments, and the open root-cause question for the right
+  wrist view
 - `PLAN_SEMANTIC_VOXEL.md` — plan for the semantic voxel task
 - `TECH_DETAIL_TASK2.md` — technical details for task 2

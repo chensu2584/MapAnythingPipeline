@@ -337,16 +337,23 @@ def validate_unprojection_consistency(
     mask,
     *,
     absolute_tolerance_m=2e-3,
-    relative_tolerance=5e-4,
+    relative_tolerance=4e-3,
 ):
     """Validate CPU re-unprojection against GPU-stored world points.
 
-    GPU inference may use BF16/TF32 while this script replays the operation in
-    CPU float32.  The resulting Cartesian error grows with range, so a fixed
-    absolute threshold incorrectly rejects distant points.  Use a per-point
-    L-infinity bound of ``atol + rtol * ||point||`` instead.  At 2 m the default
-    limit is 3 mm; at 20 m it is 12 mm, still tight enough to catch a wrong K,
-    pose, depth convention, or matrix direction.
+    GPU inference runs under bfloat16 autocast while this script replays the
+    operation in CPU float32.  The resulting Cartesian error grows with range,
+    so a fixed absolute threshold incorrectly rejects distant points.  Use a
+    per-point L-infinity bound of ``atol + rtol * ||point||`` instead.
+
+    ``relative_tolerance`` is set from the precision of the arithmetic being
+    replayed, not from a wish: bfloat16 keeps an 8-bit mantissa, so its relative
+    precision is about ``2**-8 = 3.9e-3``.  A tighter bound asks a bf16 result to
+    be more accurate than bf16 can represent, and fails on distant points for
+    purely numerical reasons.  At 2 m the limit is 10 mm and at 20 m it is 82 mm,
+    which still catches a wrong K, pose, depth convention or matrix direction --
+    those are wrong by a fraction of the point coordinates themselves, that is
+    by meters, not millimeters.
     """
 
     computed = np.asarray(computed)
@@ -545,6 +552,14 @@ def process_capture(
     gripper_poses = None
     gripper_pose_path = None
     if show_grippers:
+        # G1-only: the overlay resolves G1 link names and needs the G1
+        # pose_conversion_manifest.json.  Say so rather than failing on a bare
+        # missing file when this runs against another robot's capture.
+        if not os.path.isfile(os.path.join(out_dir, "pose_conversion_manifest.json")):
+            raise ValueError(
+                "--show_grippers is G1-specific: it needs pose_conversion_manifest.json, "
+                f"which {capture} does not have. Omit the flag for non-G1 captures."
+            )
         gripper_poses = resolve_gripper_poses(
             out_dir,
             g1_urdf=g1_urdf,

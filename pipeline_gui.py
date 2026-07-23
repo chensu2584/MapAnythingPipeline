@@ -23,12 +23,23 @@ from pose_export import (
     DEFAULT_POSE_EXPORT_MODE,
     MODEL_RELATIVE_HEAD_ANCHORED,
     MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED,
+    MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_AFFINE,
+    MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_SCALED,
     POSE_EXPORT_MODES,
 )
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+# The core pipeline every capture goes through.
 STAGES = ("undistort", "run_inference", "filter_export", "voxelize")
+# Opt-in extras.  They stay out of STAGES so selecting the whole pipeline does
+# not silently require a URDF, and so existing callers keep working.
+OPTIONAL_STAGES = ("self_mask", "diagnose")
+ALL_STAGES = STAGES + OPTIONAL_STAGES
+# "auto" is a UI choice only: it is resolved to a concrete robot when the
+# config is read, so command construction never has to guess.
+ROBOT_CHOICES = ("auto", "g1", "g2")
+ROBOT_PROFILES = ("g1", "g2")
 RAW_REQUIRED_FILES = {
     "head.png",
     "hand_left.png",
@@ -37,6 +48,8 @@ RAW_REQUIRED_FILES = {
     "intrinsic_hand_left_rgb.json",
     "intrinsic_hand_right_rgb.json",
 }
+# A G2 snapshot is identified by its single extrinsics document instead.
+G2_REQUIRED_FILE = "camera_extrinsics.json"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,6 +69,14 @@ class PipelineConfig:
     export_per_camera_k_ab_glb: bool = False
     reuse_preprocessed: bool = True
     fast_inference: bool = False
+    robot: str = "g1"
+    depth_input: bool = False
+    depth_holdout: float = 0.0
+    self_mask_input: bool = False
+    urdf: str = ""
+    mask_dilate_px: int = 12
+    mask_gripper_shrink: float = 0.7
+    swap_wrist_views: bool = False
 
 
 def format_duration(seconds: float) -> str:
@@ -67,18 +88,44 @@ def format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def discover_captures(data_root: Path) -> list[str]:
+def capture_layout(child: Path) -> str | None:
+    """Return the robot layout of one folder, or None when it is not a capture."""
+
+    if all((child / filename).is_file() for filename in RAW_REQUIRED_FILES):
+        return "g1"
+    if (child / G2_REQUIRED_FILE).is_file():
+        return "g2"
+    return None
+
+
+def discover_captures(data_root: Path, robot: str = "auto") -> list[str]:
     """Find raw capture folders without importing heavy pipeline packages."""
 
     root = data_root.expanduser()
     if not root.is_dir():
         return []
-    return sorted(
-        child.name
+    found = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        layout = capture_layout(child)
+        if layout is not None and robot in ("auto", layout):
+            found.append(child.name)
+    return found
+
+
+def detect_root_layout(data_root: Path) -> str | None:
+    """Return the single layout a folder holds, or None if empty or mixed."""
+
+    root = data_root.expanduser()
+    if not root.is_dir():
+        return None
+    layouts = {
+        layout
         for child in root.iterdir()
-        if child.is_dir()
-        and all((child / filename).is_file() for filename in RAW_REQUIRED_FILES)
-    )
+        if child.is_dir() and (layout := capture_layout(child)) is not None
+    }
+    return layouts.pop() if len(layouts) == 1 else None
 
 
 def _append_captures(command: list[str], captures: Iterable[str]) -> None:
@@ -95,7 +142,7 @@ def build_pipeline_commands(
 ) -> list[tuple[str, list[str]]]:
     """Build argv-only commands; subprocesses never use a shell."""
 
-    unknown = set(config.stages) - set(STAGES)
+    unknown = set(config.stages) - set(ALL_STAGES)
     if unknown:
         raise ValueError(f"Unknown pipeline stages: {sorted(unknown)}")
     if config.voxel_size <= 0:
@@ -104,6 +151,15 @@ def build_pipeline_commands(
         raise ValueError("Max radius must be positive when supplied")
     if config.pose_export_mode not in POSE_EXPORT_MODES:
         raise ValueError(f"Unknown pose export mode: {config.pose_export_mode}")
+    if config.robot not in ROBOT_PROFILES:
+        raise ValueError(
+            f"Robot must be resolved to one of {ROBOT_PROFILES} before building "
+            f"commands, got {config.robot!r}"
+        )
+    if not 0.0 <= config.depth_holdout < 1.0:
+        raise ValueError("Depth holdout must be in [0, 1)")
+    if not 0.0 < config.mask_gripper_shrink <= 1.0:
+        raise ValueError("Gripper shrink must be in (0, 1]")
 
     py = str(python_executable)
     data_root = str(config.data_root.expanduser().resolve())
@@ -121,12 +177,36 @@ def build_pipeline_commands(
             "--output-root",
             output_root,
         ]
+        command.extend(("--robot", config.robot))
         _append_captures(command, config.captures)
         if not config.use_metric_poses:
             command.append("--ignore-poses")
         if config.reuse_preprocessed:
             command.append("--reuse-existing")
         result.append(("undistort", command))
+
+    if "self_mask" in config.stages:
+        if not config.urdf:
+            raise ValueError("The self-occlusion mask stage needs a URDF path")
+        command = [
+            py,
+            "-u",
+            str(script_dir / "self_occlusion_mask.py"),
+            "--session",
+            data_root,
+            "--output-root",
+            output_root,
+            "--urdf",
+            str(Path(config.urdf).expanduser()),
+            "--robot",
+            config.robot,
+            "--dilate-px",
+            str(config.mask_dilate_px),
+        ]
+        if config.mask_gripper_shrink != 1.0:
+            command.extend(("--shrink-links", f"gripper={config.mask_gripper_shrink}"))
+        _append_captures(command, config.captures)
+        result.append(("self_mask", command))
 
     if "run_inference" in config.stages:
         command = [
@@ -149,6 +229,16 @@ def build_pipeline_commands(
             command.extend(("--max_radius", str(config.max_radius)))
         if config.fast_inference:
             command.append("--fast-inference")
+        if config.depth_input:
+            command.append("--depth-input")
+            if config.depth_holdout > 0.0:
+                command.extend(("--depth-holdout", str(config.depth_holdout)))
+        if config.self_mask_input:
+            command.append("--self-mask-input")
+        if config.swap_wrist_views:
+            # Feed the wrist views in the opposite order. Outputs stay keyed by
+            # name; only the index each camera occupies changes.
+            command.extend(("--view-order", "head,hand_right,hand_left"))
         result.append(("run_inference", command))
 
     if "filter_export" in config.stages:
@@ -164,7 +254,7 @@ def build_pipeline_commands(
             command.extend(("--max_radius", str(config.max_radius)))
         if config.show_scene_markers:
             command.append("--show_cameras")
-        if config.show_gripper_markers:
+        if config.show_gripper_markers and config.robot == "g1":
             command.append("--show_grippers")
         if config.export_view_colored_glb:
             command.append("--color_by_view")
@@ -185,9 +275,25 @@ def build_pipeline_commands(
         _append_captures(command, config.captures)
         if config.max_radius is not None:
             command.extend(("--max_radius", str(config.max_radius)))
-        if config.show_gripper_markers:
+        if config.show_gripper_markers and config.robot == "g1":
             command.append("--show_grippers")
         result.append(("voxelize", command))
+
+    if "diagnose" in config.stages:
+        command = [
+            py,
+            "-u",
+            str(script_dir / "diagnose_reconstruction.py"),
+            "--session",
+            data_root,
+            "--output-root",
+            output_root,
+            "--robot",
+            config.robot,
+            "--planes",
+        ]
+        _append_captures(command, config.captures)
+        result.append(("diagnose", command))
 
     return result
 
@@ -215,10 +321,20 @@ class PipelineGui:
         self.export_per_camera_k_ab_glb_var = tk.BooleanVar(value=False)
         self.reuse_preprocessed_var = tk.BooleanVar(value=True)
         self.fast_inference_var = tk.BooleanVar(value=False)
+        self.robot_var = tk.StringVar(value="auto")
+        self.depth_input_var = tk.BooleanVar(value=False)
+        self.depth_holdout_var = tk.StringVar(value="0.3")
+        self.self_mask_input_var = tk.BooleanVar(value=False)
+        self.urdf_var = tk.StringVar(value="")
+        self.mask_dilate_var = tk.StringVar(value="12")
+        self.mask_shrink_var = tk.StringVar(value="0.7")
+        self.swap_wrist_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready")
         self.elapsed_var = tk.StringVar(value="Elapsed: --:--:--")
         self.stage_vars = {
-            name: tk.BooleanVar(value=True) for name in STAGES
+            # Extras default off: they cost time and the mask stage needs a URDF.
+            name: tk.BooleanVar(value=name in STAGES)
+            for name in ALL_STAGES
         }
 
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -357,20 +473,26 @@ class PipelineGui:
             "run_inference": "2. Run inference",
             "filter_export": "3. Filter / export",
             "voxelize": "4. Voxelize",
+            "self_mask": "+ Robot self-occlusion mask (needs URDF; runs after 1)",
+            "diagnose": "+ Diagnose against the depth camera (runs last)",
         }
-        for row, name in enumerate(STAGES, start=1):
+        for row, name in enumerate(ALL_STAGES, start=1):
             ttk.Checkbutton(settings, text=labels[name], variable=self.stage_vars[name]).grid(
                 row=row, column=0, sticky="w", pady=2
             )
-        ttk.Separator(settings).grid(row=5, column=0, sticky="ew", pady=8)
+        # A running counter rather than literal row numbers: hand-maintained
+        # indices silently stack two widgets in one cell when the list above
+        # changes length, and the later one simply hides the earlier.
+        next_row = iter(range(len(ALL_STAGES) + 1, 100)).__next__
+        ttk.Separator(settings).grid(row=next_row(), column=0, sticky="ew", pady=8)
         ttk.Checkbutton(
             settings,
             text="Use calibrated camera extrinsics as model input",
             variable=self.use_poses_var,
             command=self._update_pose_mode_text,
-        ).grid(row=6, column=0, sticky="w")
+        ).grid(row=next_row(), column=0, sticky="w")
         pose_selector = ttk.Frame(settings)
-        pose_selector.grid(row=7, column=0, sticky="ew", pady=(6, 0))
+        pose_selector.grid(row=next_row(), column=0, sticky="ew", pady=(6, 0))
         pose_selector.columnconfigure(1, weight=1)
         ttk.Label(pose_selector, text="Output geometry").grid(
             row=0, column=0, sticky="w", padx=(0, 8)
@@ -388,10 +510,10 @@ class PipelineGui:
         )
         ttk.Label(
             settings, textvariable=self.pose_mode_var, wraplength=520, foreground="#7c2d12"
-        ).grid(row=8, column=0, sticky="ew", pady=(4, 10))
+        ).grid(row=next_row(), column=0, sticky="ew", pady=(4, 10))
 
         options = ttk.Frame(settings)
-        options.grid(row=9, column=0, sticky="ew")
+        options.grid(row=next_row(), column=0, sticky="ew")
         options.columnconfigure(1, weight=1)
         ttk.Label(options, text="Max radius (blank = none)").grid(row=0, column=0, sticky="w")
         ttk.Entry(options, textvariable=self.max_radius_var, width=10).grid(
@@ -439,6 +561,57 @@ class PipelineGui:
             variable=self.fast_inference_var,
         ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
+        robot_row = ttk.Frame(options)
+        robot_row.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        ttk.Label(robot_row, text="Robot").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.robot_combo = ttk.Combobox(
+            robot_row,
+            textvariable=self.robot_var,
+            values=ROBOT_CHOICES,
+            state="readonly",
+            width=8,
+        )
+        self.robot_combo.grid(row=0, column=1, sticky="w")
+        self.robot_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self.refresh_captures()
+        )
+        ttk.Checkbutton(
+            options,
+            text="Feed metric depth to the model (G2 only)",
+            variable=self.depth_input_var,
+            command=self._update_pose_mode_text,
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(
+            options,
+            text="Hide the robot from the model (experiment: does the gripper distort it?)",
+            variable=self.self_mask_input_var,
+        ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        urdf_row = ttk.Frame(options)
+        urdf_row.grid(row=13, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        urdf_row.columnconfigure(1, weight=1)
+        ttk.Label(urdf_row, text="URDF (self-mask stage)").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(urdf_row, textvariable=self.urdf_var).grid(row=0, column=1, sticky="ew")
+        ttk.Button(urdf_row, text="Browse", command=self.choose_urdf).grid(row=0, column=2, padx=(6, 0))
+        ttk.Label(urdf_row, text="dilate px").grid(row=0, column=3, sticky="w", padx=(10, 6))
+        ttk.Entry(urdf_row, textvariable=self.mask_dilate_var, width=6).grid(row=0, column=4)
+        ttk.Label(urdf_row, text="gripper shrink").grid(row=0, column=5, sticky="w", padx=(10, 6))
+        ttk.Entry(urdf_row, textvariable=self.mask_shrink_var, width=6).grid(row=0, column=6)
+
+        ttk.Checkbutton(
+            options,
+            text="Swap the two wrist views (is the worst view worst by camera, or by index?)",
+            variable=self.swap_wrist_var,
+        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(7, 0))
+
+        holdout_row = ttk.Frame(options)
+        holdout_row.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(holdout_row, text="Depth holdout fraction").grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        ttk.Entry(holdout_row, textvariable=self.depth_holdout_var, width=8).grid(
+            row=0, column=1, sticky="w"
+        )
+
         actions = ttk.Frame(self.root)
         actions.grid(row=2, column=0, sticky="ew", padx=14, pady=8)
         actions.columnconfigure(0, weight=1)
@@ -479,6 +652,13 @@ class PipelineGui:
             self.data_root_var.set(selected)
             self.refresh_captures()
 
+    def choose_urdf(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select the robot URDF", filetypes=[("URDF", "*.urdf"), ("All files", "*")]
+        )
+        if path:
+            self.urdf_var.set(path)
+
     def choose_output_root(self) -> None:
         selected = filedialog.askdirectory(
             title="Choose output folder", initialdir=self.output_root_var.get(), parent=self.root
@@ -487,7 +667,9 @@ class PipelineGui:
             self.output_root_var.set(selected)
 
     def refresh_captures(self) -> None:
-        self.capture_names = discover_captures(Path(self.data_root_var.get()))
+        self.capture_names = discover_captures(
+            Path(self.data_root_var.get()), self.robot_var.get()
+        )
         self.capture_list.delete(0, tk.END)
         for name in self.capture_names:
             self.capture_list.insert(tk.END, name)
@@ -509,6 +691,33 @@ class PipelineGui:
                     "Recommended: fit one scale from the three calibrated/model camera "
                     "baselines, scale model depth and relative translations together, "
                     "then anchor the calibrated head."
+                )
+            elif (
+                self.pose_export_mode_var.get()
+                == MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_SCALED
+            ):
+                note = (
+                    "G2 only: fit that scale per pixel against the metric head depth "
+                    "camera instead of three camera baselines, which constrains scene "
+                    "depth directly. Falls back to the baseline fit and records why if "
+                    "the depth fit cannot be defended."
+                )
+                if self.depth_input_var.get():
+                    note += (
+                        "  Depth is also being fed to the model, so the head-view "
+                        "agreement is circular: set a holdout fraction above 0."
+                    )
+                self.pose_mode_var.set(note)
+            elif (
+                self.pose_export_mode_var.get()
+                == MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_AFFINE
+            ):
+                self.pose_mode_var.set(
+                    "DIAGNOSTIC ONLY. Corrects depth as measured = a * model + b, which "
+                    "fits the measured error far better than any single scale. But an "
+                    "affine correction is not a similarity transform: it stretches the "
+                    "scene differently at each range and breaks agreement between the "
+                    "three cameras. Use it to measure the error, never to plan against."
                 )
             elif self.pose_export_mode_var.get() == MODEL_RELATIVE_HEAD_ANCHORED:
                 self.pose_mode_var.set(
@@ -535,7 +744,7 @@ class PipelineGui:
         selected = tuple(self.capture_names[i] for i in self.capture_list.curselection())
         if not selected:
             raise ValueError("Select at least one compatible capture")
-        stages = tuple(name for name in STAGES if self.stage_vars[name].get())
+        stages = tuple(name for name in ALL_STAGES if self.stage_vars[name].get())
         if not stages:
             raise ValueError("Select at least one pipeline step")
         radius_text = self.max_radius_var.get().strip()
@@ -544,6 +753,13 @@ class PipelineGui:
         device = self.device_var.get().strip()
         if not device:
             raise ValueError("Inference device cannot be empty")
+        holdout_text = self.depth_holdout_var.get().strip()
+        depth_holdout = float(holdout_text) if holdout_text else 0.0
+        # Resolve "auto" here so command construction never has to guess which
+        # robot-specific flags apply.
+        robot = self.robot_var.get()
+        if robot == "auto":
+            robot = detect_root_layout(data_root) or "g1"
         return PipelineConfig(
             data_root=data_root,
             output_root=output_root,
@@ -562,6 +778,14 @@ class PipelineGui:
             ),
             reuse_preprocessed=self.reuse_preprocessed_var.get(),
             fast_inference=self.fast_inference_var.get(),
+            robot=robot,
+            depth_input=self.depth_input_var.get(),
+            depth_holdout=depth_holdout,
+            self_mask_input=self.self_mask_input_var.get(),
+            urdf=self.urdf_var.get().strip(),
+            mask_dilate_px=int(self.mask_dilate_var.get() or 12),
+            mask_gripper_shrink=float(self.mask_shrink_var.get() or 1.0),
+            swap_wrist_views=self.swap_wrist_var.get(),
         )
 
     def start(self) -> None:

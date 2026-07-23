@@ -24,10 +24,14 @@ from capture_contract import (
     IMAGE_TO_INTRINSIC,
     POSES_FILE,
     PROVENANCE_FILES,
-    resolve_captures,
     load_intrinsics,
     validate_pose_document,
 )
+from depth_tools import register_depth_to_camera
+from robot_profiles import detect_profile, get_profile
+
+DEPTH_FILE = "registered_depth.npz"
+CAPTURE_STATE_FILE = "capture_state.json"
 
 # Machine-specific roots; override via env vars instead of editing code:
 #   G2_DATA_ROOT: dir containing the capture folders (g_1_Test_*)
@@ -50,29 +54,34 @@ def _sha256(path):
     return digest.hexdigest()
 
 
-def build_preprocess_cache_record(cap_in, ignore_poses=False):
-    """Fingerprint every source file that affects reusable preprocessing output."""
+def build_preprocess_cache_record(cap_in, ignore_poses=False, profile_name="g1"):
+    """Fingerprint every source file that affects reusable preprocessing output.
+
+    Robot layouts differ in which files exist, so every non-hidden regular file
+    in the capture folder is fingerprinted rather than a per-robot allow-list.
+    That is layout-agnostic and strictly more conservative: any source change at
+    all invalidates the cache.
+    """
 
     cap_in = Path(cap_in)
-    required = [
-        *(cap_in / f"{name}.png" for name in IMAGE_TO_INTRINSIC),
-        *(cap_in / filename for filename in IMAGE_TO_INTRINSIC.values()),
-    ]
-    optional = [
-        cap_in / POSES_FILE,
-        *(cap_in / filename for filename in PROVENANCE_FILES),
-    ]
+    if not cap_in.is_dir():
+        raise FileNotFoundError(f"Capture folder does not exist: {cap_in}")
+    sources = sorted(
+        path
+        for path in cap_in.rglob("*")
+        if path.is_file() and not any(part.startswith(".") for part in path.relative_to(cap_in).parts)
+    )
+    if not sources:
+        raise FileNotFoundError(f"Capture folder has no readable inputs: {cap_in}")
     inputs = {}
     digest = hashlib.sha256()
     digest.update(f"undistort-cache-v{PREPROCESS_CACHE_VERSION}\n".encode())
+    digest.update(f"profile={profile_name}\n".encode())
     digest.update(f"ignore_poses={bool(ignore_poses)}\n".encode())
-    for path in (*required, *(path for path in optional if path.is_file())):
-        if not path.is_file():
-            raise FileNotFoundError(f"Missing preprocessing input: {path}")
+    for path in sources:
         relative = path.relative_to(cap_in).as_posix()
         file_digest = _sha256(path)
-        size = path.stat().st_size
-        inputs[relative] = {"sha256": file_digest, "size": size}
+        inputs[relative] = {"sha256": file_digest, "size": path.stat().st_size}
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
         digest.update(file_digest.encode("ascii"))
@@ -80,6 +89,7 @@ def build_preprocess_cache_record(cap_in, ignore_poses=False):
     return {
         "version": PREPROCESS_CACHE_VERSION,
         "key": digest.hexdigest(),
+        "profile": profile_name,
         "ignore_poses": bool(ignore_poses),
         "inputs": inputs,
     }
@@ -98,21 +108,15 @@ def reusable_preprocess_manifest(cap_out, cache_record):
     if not isinstance(manifest, dict) or manifest.get("cache") != cache_record:
         return None
 
-    required_outputs = [
-        *(cap_out / f"{name}.png" for name in IMAGE_TO_INTRINSIC),
-        *(cap_out / f"{name}_K.json" for name in IMAGE_TO_INTRINSIC),
-    ]
-    input_names = cache_record["inputs"]
-    required_outputs.extend(
-        cap_out / filename for filename in PROVENANCE_FILES if filename in input_names
-    )
-    source_pose_present = POSES_FILE in input_names
-    pose_out = cap_out / POSES_FILE
-    if source_pose_present and not cache_record["ignore_poses"]:
-        required_outputs.append(pose_out)
-    elif pose_out.exists():
+    # Trust the manifest's own record of what it wrote rather than re-deriving
+    # the expected file set, which differs per robot layout.
+    written = manifest.get("written_outputs")
+    if not isinstance(written, list) or not written:
         return None
-    if not all(path.is_file() for path in required_outputs):
+    if not all((cap_out / name).is_file() for name in written):
+        return None
+    pose_out = cap_out / POSES_FILE
+    if cache_record["ignore_poses"] and pose_out.exists():
         return None
     return manifest
 
@@ -142,6 +146,78 @@ def undistort_image(img, K, dist):
     return undist, adjK, (x, y, rw, rh)
 
 
+def build_pose_document(raw, profile):
+    """Synthesise the canonical pose document from an already-metric capture.
+
+    G1 captures ship this file; G2 carries the same information inside its
+    extrinsics document, so it is rewritten here in one shared format instead of
+    teaching every downstream stage a second contract.
+    """
+    poses = {}
+    for name in profile.view_names:
+        matrix = raw.views[name].base_T_cam
+        if matrix is None:
+            return None
+        poses[name] = np.asarray(matrix, dtype=np.float64).tolist()
+    return {
+        "frame_convention": profile.pose_frame_convention,
+        "world_frame": profile.world_frame,
+        "translation_unit": "meter",
+        "extrinsic_direction": profile.extrinsic_direction,
+        "camera_axes": "OpenCV RDF: +X right, +Y down, +Z forward",
+        "matrix_direction": "camera_to_world",
+        "poses": poses,
+        "derived_from": raw.provenance.get("extrinsics_document"),
+        "robot_profile": profile.name,
+    }
+
+
+def write_registered_depth(cap_out, raw, profile, view_results, splat_radius=0):
+    """Reproject each metric depth map into its undistorted colour view."""
+    if not raw.depths:
+        return None
+    payload = {}
+    report = {}
+    for view_name, depth in raw.depths.items():
+        target = view_results.get(view_name)
+        colour = raw.views.get(view_name)
+        if target is None or colour is None or colour.base_T_cam is None:
+            continue
+        K_target = np.asarray(target["K"], dtype=np.float64)
+        depth_z, valid, stats = register_depth_to_camera(
+            depth.depth_m,
+            depth.valid,
+            K_source=depth.K,
+            base_T_source=depth.base_T_cam,
+            K_target=K_target,
+            base_T_target=colour.base_T_cam,
+            target_shape=(target["height"], target["width"]),
+            splat_radius=splat_radius,
+        )
+        payload[f"{view_name}_depth_z"] = depth_z.astype(np.float32)
+        payload[f"{view_name}_depth_valid"] = valid
+        stats.update(
+            {
+                "source_camera": depth.name,
+                "source_shape": [int(v) for v in depth.depth_m.shape],
+                "target_shape": [int(target["height"]), int(target["width"])],
+                "unit_scale_to_m": depth.unit_scale_to_m,
+                "invalid_source_values": list(depth.invalid_values),
+            }
+        )
+        report[view_name] = stats
+    if not payload:
+        return None
+    payload["views"] = np.asarray(sorted(report))
+    payload["world_frame"] = np.asarray(profile.world_frame)
+    payload["translation_unit"] = np.asarray("meter")
+    payload["depth_convention"] = np.asarray(
+        "z_along_target_camera_optical_axis; NaN marks invalid"
+    )
+    np.savez_compressed(cap_out / DEPTH_FILE, **payload)
+    return report
+
+
 def process_capture(
     capture,
     data_root,
@@ -149,48 +225,62 @@ def process_capture(
     allow_missing_poses=False,
     ignore_poses=False,
     reuse_existing=False,
+    profile=None,
+    depth_splat_radius=0,
 ):
     cap_in = Path(data_root) / capture
     cap_out = Path(output_root) / "undistorted" / capture
-    print(f"\n=== {capture} ===")
+    profile = profile or detect_profile(data_root, capture)
+    print(f"\n=== {capture} [{profile.name}] ===")
 
-    cache_record = build_preprocess_cache_record(cap_in, ignore_poses=ignore_poses)
+    cache_record = build_preprocess_cache_record(
+        cap_in, ignore_poses=ignore_poses, profile_name=profile.name
+    )
     if reuse_existing:
         cached_manifest = reusable_preprocess_manifest(cap_out, cache_record)
         if cached_manifest is not None:
             print("  reuse: undistorted images and metadata are unchanged; skipping remap")
             return cached_manifest
 
+    # Load and validate the whole capture before creating any partial output.
+    raw = profile.load(data_root, capture)
+
     poses_src = cap_in / POSES_FILE
     pose_contract = None
+    pose_document = None
     if ignore_poses:
         print("  pose: explicitly ignored; preparing pose-free model input")
     elif poses_src.is_file():
         _, pose_contract = validate_pose_document(poses_src)
-    elif not allow_missing_poses:
-        raise FileNotFoundError(
-            f"{poses_src} is required for metric reconstruction; "
-            "use --allow-missing-poses only for intentional pose-free inference"
-        )
-
-    # Validate all image/intrinsic pairs before creating partial output.
-    loaded = {}
-    for name, intr_file in IMAGE_TO_INTRINSIC.items():
-        img_path = cap_in / f"{name}.png"
-        img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)  # BGR
-        if img is None:
-            raise FileNotFoundError(f"Cannot read image: {img_path}")
-        H, W = img.shape[:2]
-        K, dist = load_K_dist(cap_in / intr_file, W, H)
-        loaded[name] = (img, K, dist, W, H)
+    else:
+        pose_document = build_pose_document(raw, profile)
+        if pose_document is None and not allow_missing_poses:
+            raise FileNotFoundError(
+                f"{poses_src} is required for metric reconstruction and {capture} carries "
+                "no per-view extrinsics; use --allow-missing-poses only for intentional "
+                "pose-free inference"
+            )
 
     cap_out.mkdir(parents=True, exist_ok=True)
+    written_outputs = []
     poses_out = cap_out / POSES_FILE
     if pose_contract is not None:
         shutil.copy2(poses_src, poses_out)
+        written_outputs.append(POSES_FILE)
         print(
             f"  pose: {pose_contract['frame_convention']}, "
-            f"world={pose_contract['world_frame']}, unit=m"
+            f"world={pose_contract['world_frame']}, unit=m (copied unchanged)"
+        )
+    elif pose_document is not None:
+        with poses_out.open("w", encoding="utf-8") as handle:
+            json.dump(pose_document, handle, indent=2)
+        # Re-read through the shared validator so a synthesised document has to
+        # satisfy exactly the same contract as a shipped one.
+        _, pose_contract = validate_pose_document(poses_out)
+        written_outputs.append(POSES_FILE)
+        print(
+            f"  pose: {pose_contract['frame_convention']}, "
+            f"world={pose_contract['world_frame']}, unit=m (derived from capture extrinsics)"
         )
     else:
         # A previous metric preprocessing run may have left a pose file in the
@@ -205,11 +295,13 @@ def process_capture(
         if source.is_file():
             shutil.copy2(source, cap_out / filename)
             copied_metadata.append(filename)
+            written_outputs.append(filename)
 
     view_results = {}
-    for name, (img, K, dist, W, H) in loaded.items():
-        intr_file = IMAGE_TO_INTRINSIC[name]
-        undist, adjK, roi = undistort_image(img, K, dist)
+    for name in profile.view_names:
+        view = raw.views[name]
+        H, W = view.image_bgr.shape[:2]
+        undist, adjK, roi = undistort_image(view.image_bgr, view.K, view.dist)
         oh, ow = undist.shape[:2]
 
         out_png = cap_out / f"{name}.png"
@@ -226,12 +318,13 @@ def process_capture(
             "orig_width": int(W),
             "orig_height": int(H),
             "roi": [int(v) for v in roi],
-            "source_intrinsic": intr_file,
+            "source_intrinsic": view.intrinsic_source,
             "distortion_removed": True,
         }
         with (cap_out / f"{name}_K.json").open("w", encoding="utf-8") as f:
             json.dump(k_document, f, indent=2)
         view_results[name] = k_document
+        written_outputs.extend([f"{name}.png", f"{name}_K.json"])
         cx_off = adjK[0, 2] - ow / 2.0
         cy_off = adjK[1, 2] - oh / 2.0
         print(
@@ -240,16 +333,51 @@ def process_capture(
             f"Cy={adjK[1,2]:.1f}({cy_off:+.1f} from center) roi={roi}"
         )
 
+    depth_report = write_registered_depth(
+        cap_out, raw, profile, view_results, splat_radius=depth_splat_radius
+    )
+    if depth_report:
+        written_outputs.append(DEPTH_FILE)
+        for view_name, stats in depth_report.items():
+            print(
+                f"  depth[{view_name}] {stats['source_camera']} -> undistorted {view_name}: "
+                f"{stats['target_filled_pixels']} px "
+                f"({100 * stats['target_fill_ratio']:.1f}% of frame), "
+                f"behind_camera={stats['dropped_behind_camera']}, "
+                f"outside_frame={stats['dropped_outside_frame']}"
+            )
+
+    if raw.joint_positions:
+        state = {
+            "schema_version": 1,
+            "robot_profile": profile.name,
+            "world_frame": profile.world_frame,
+            "joint_positions_rad": raw.joint_positions,
+            "source": raw.provenance.get("extrinsics_document"),
+            "kinematic_validation": raw.provenance.get("kinematic_validation"),
+            "synchronisation": raw.provenance.get("synchronisation"),
+        }
+        with (cap_out / CAPTURE_STATE_FILE).open("w", encoding="utf-8") as handle:
+            json.dump(state, handle, indent=2)
+        if CAPTURE_STATE_FILE not in written_outputs:
+            written_outputs.append(CAPTURE_STATE_FILE)
+
     preprocess_manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "capture": capture,
+        "robot_profile": profile.name,
         "source_capture_dir": str(cap_in.resolve()),
+        "source_layout": raw.provenance.get("layout"),
         "pose_contract": pose_contract,
-        "pose_copied_unchanged": pose_contract is not None,
+        "pose_copied_unchanged": poses_src.is_file() and not ignore_poses,
+        "pose_derived_from_capture": pose_document is not None,
         "pose_input_mode": "ignored" if ignore_poses else "metric_if_available",
         "source_pose_was_present": poses_src.is_file(),
         "copied_provenance_files": copied_metadata,
         "views": view_results,
+        "depth": depth_report,
+        "capture_provenance": raw.provenance,
+        "written_outputs": sorted(set(written_outputs)),
         "cache": cache_record,
     }
     with (cap_out / "pipeline_preprocess_manifest.json").open(
@@ -290,9 +418,34 @@ def main():
             "match the previous preprocessing manifest"
         ),
     )
+    parser.add_argument(
+        "--robot",
+        default=None,
+        help="Robot profile (g1/g2); omit to detect it from the capture layout",
+    )
+    parser.add_argument(
+        "--depth-splat-radius",
+        type=int,
+        default=0,
+        help=(
+            "Widen each reprojected depth sample into a square of this radius to "
+            "close forward-mapping holes; trades edge bleeding for coverage"
+        ),
+    )
     args = parser.parse_args()
-    captures = resolve_captures(args.data_root, args.captures, preprocessed=False)
+    profile = (
+        get_profile(args.robot) if args.robot else detect_profile(args.data_root)
+    )
+    captures = list(args.captures) if args.captures else profile.discover(args.data_root)
+    if not captures:
+        raise FileNotFoundError(
+            f"No {profile.name} captures found under {Path(args.data_root).resolve()}"
+        )
+    for capture in captures:
+        if not capture or Path(capture).name != capture:
+            raise ValueError(f"Capture must be a folder name, not a path: {capture!r}")
     print(f"Input root: {Path(args.data_root).resolve()}")
+    print(f"Robot profile: {profile.name}")
     print(f"Captures: {', '.join(captures)}")
     for capture in captures:
         process_capture(
@@ -302,6 +455,8 @@ def main():
             allow_missing_poses=args.allow_missing_poses,
             ignore_poses=args.ignore_poses,
             reuse_existing=args.reuse_existing,
+            profile=profile,
+            depth_splat_radius=args.depth_splat_radius,
         )
     print("\nUndistortion complete.")
 

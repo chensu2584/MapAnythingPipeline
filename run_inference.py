@@ -40,7 +40,10 @@ from pose_export import (
     MODEL_PREDICTION_ARBITRARY_SCALE,
     MODEL_RELATIVE_HEAD_ANCHORED,
     MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED,
+    MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_AFFINE,
+    MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_SCALED,
     POSE_EXPORT_MODES,
+    estimate_depth_similarity_scale,
     pose_delta,
     select_export_poses,
 )
@@ -105,12 +108,148 @@ def _load_adjusted_K(path, image_width, image_height):
     return K
 
 
+def resolve_view_order(spec):
+    """Return the order views are fed to the model, defaulting to VIEW_NAMES.
+
+    Only the order changes; every output stays keyed by view name, so nothing
+    downstream has to know. View 0 stays the head because the export anchors the
+    calibrated head pose and fits scale relative to it.
+
+    Reordering exists to separate two explanations for one view always being the
+    worst: the physical camera's geometry, or its index. MapAnything makes all
+    poses relative to view 0, so the last view is not interchangeable with the
+    first by construction. If the error follows the index after a swap it is an
+    algorithmic effect; if it follows the camera it is geometry.
+    """
+    if not spec:
+        return tuple(VIEW_NAMES)
+    order = tuple(name.strip() for name in spec.split(",") if name.strip())
+    if sorted(order) != sorted(VIEW_NAMES):
+        raise ValueError(
+            f"--view-order must be a permutation of {VIEW_NAMES}, got {order}"
+        )
+    if order[0] != VIEW_NAMES[0]:
+        raise ValueError(
+            f"View 0 must stay {VIEW_NAMES[0]!r}: the export anchors that camera's "
+            f"calibrated pose, got {order[0]!r}"
+        )
+    return order
+
+
+def load_registered_depth(capture, undist_root=DEFAULT_UNDIST_ROOT):
+    """Load Step A's metric depth, already reprojected into each colour view.
+
+    Returns ``{view: (depth_z, valid)}`` in meters, or an empty dict when the
+    capture carries no depth.  Absent depth is normal (G1 has none) and must not
+    be an error.
+    """
+    path = Path(undist_root) / capture / "registered_depth.npz"
+    if not path.is_file():
+        return {}
+    result = {}
+    with np.load(path, allow_pickle=False) as data:
+        for key in data.files:
+            if not key.endswith("_depth_z"):
+                continue
+            view = key[: -len("_depth_z")]
+            valid_key = f"{view}_depth_valid"
+            if valid_key not in data.files:
+                continue
+            depth = np.asarray(data[key], dtype=np.float64)
+            valid = np.asarray(data[valid_key], dtype=bool) & np.isfinite(depth)
+            result[view] = (depth, valid)
+    return result
+
+
+def load_self_occlusion_masks(capture, undist_root=DEFAULT_UNDIST_ROOT):
+    """Load Step A's robot self-occlusion masks, or an empty dict if absent.
+
+    Absent masks are normal: the capture may predate the mask stage, or the
+    robot may have no geometry in view.  Missing masks must not be an error.
+    """
+    path = Path(undist_root) / capture / "self_occlusion_mask.npz"
+    if not path.is_file():
+        return {}
+    result = {}
+    with np.load(path, allow_pickle=False) as data:
+        for key in data.files:
+            if key.endswith("_self_mask"):
+                result[key[: -len("_self_mask")]] = np.asarray(data[key], dtype=bool)
+    return result
+
+
+def resample_mask_to(mask, target_hw):
+    """Nearest-neighbour resample a boolean mask to ``target_hw`` by size alone.
+
+    Only valid when the target is a plain rescale of the source.  Use
+    ``reproject_mask_with_intrinsics`` whenever a K is available: preprocessing
+    crops as well as resizes, and a size-only mapping silently shifts the mask.
+    """
+    target_h, target_w = (int(v) for v in target_hw)
+    height, width = mask.shape
+    if (height, width) == (target_h, target_w):
+        return mask
+    rows = np.clip((np.arange(target_h) + 0.5) * height / target_h, 0, height - 1).astype(int)
+    cols = np.clip((np.arange(target_w) + 0.5) * width / target_w, 0, width - 1).astype(int)
+    return mask[np.ix_(rows, cols)]
+
+
+def reproject_mask_with_intrinsics(mask, K_source, K_target, target_hw):
+    """Map a mask between two pinhole views of the same optical axis.
+
+    ``preprocess_inputs`` crops before it resizes, so the model's output grid
+    does not cover the whole input frame.  Mapping by image size alone therefore
+    stretches the mask across a frame it no longer matches -- on the G2 wrist
+    views that is a ~19 percent stretch and up to ~100 px of displacement near
+    the edges, enough to move the mask off the gripper and onto the scene.
+
+    Both grids share an optical centre, so the pixel mapping follows exactly
+    from the two intrinsic matrices and needs no assumption about how the crop
+    was chosen.
+    """
+    target_h, target_w = (int(v) for v in target_hw)
+    height, width = mask.shape
+    K_source = np.asarray(K_source, dtype=np.float64)
+    K_target = np.asarray(K_target, dtype=np.float64)
+    u = (np.arange(target_w) + 0.5 - K_target[0, 2]) / K_target[0, 0] * K_source[0, 0] + K_source[0, 2]
+    v = (np.arange(target_h) + 0.5 - K_target[1, 2]) / K_target[1, 1] * K_source[1, 1] + K_source[1, 2]
+    cols = np.rint(u - 0.5).astype(int)
+    rows = np.rint(v - 0.5).astype(int)
+    inside_x = (cols >= 0) & (cols < width)
+    inside_y = (rows >= 0) & (rows < height)
+    sampled = mask[np.ix_(np.clip(rows, 0, height - 1), np.clip(cols, 0, width - 1))]
+    # A target pixel outside the source frame saw no robot geometry.
+    return sampled & inside_y[:, None] & inside_x[None, :]
+
+
+def resample_depth_to(depth, valid, target_hw):
+    """Nearest-neighbour resample a depth map and its validity to ``target_hw``.
+
+    Nearest neighbour rather than interpolation: averaging across a depth
+    discontinuity invents a surface that exists in neither the sensor nor the
+    model, and this map is used to fit a scale.
+    """
+    target_h, target_w = (int(v) for v in target_hw)
+    height, width = depth.shape
+    if (height, width) == (target_h, target_w):
+        return depth, valid
+    rows = np.clip((np.arange(target_h) + 0.5) * height / target_h, 0, height - 1).astype(int)
+    cols = np.clip((np.arange(target_w) + 0.5) * width / target_w, 0, width - 1).astype(int)
+    index = np.ix_(rows, cols)
+    return depth[index], valid[index]
+
+
 def load_views(
     capture,
     undist_root=DEFAULT_UNDIST_ROOT,
     allow_missing_poses=False,
     ignore_poses=False,
+    depth_inputs=None,
+    depth_holdout=0.0,
+    self_masks=None,
+    view_order=None,
 ):
+    view_order = tuple(view_order or VIEW_NAMES)
     cap_dir = Path(undist_root) / capture
 
     poses = None
@@ -133,7 +272,8 @@ def load_views(
         print("  no camera pose file found; model will estimate poses (arbitrary scale)")
 
     views = []
-    for name in VIEW_NAMES:
+    undistorted_intrinsics = {}
+    for name in view_order:
         image_path = cap_dir / f"{name}.png"
         img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if img_bgr is None:
@@ -141,6 +281,17 @@ def load_views(
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)  # HxWx3 uint8
         height, width = img_rgb.shape[:2]
         K = _load_adjusted_K(cap_dir / f"{name}_K.json", width, height)
+        if self_masks and name in self_masks:
+            robot_pixels = resample_mask_to(self_masks[name], img_rgb.shape[:2])
+            # Neutral grey rather than black: a black region reads as a dark
+            # surface, while grey carries no gradient for the network to latch
+            # onto.  The pixels are excluded from the output either way.
+            img_rgb = img_rgb.copy()
+            img_rgb[robot_pixels] = 128
+            print(
+                f"  self-mask input: {name} blanked {int(robot_pixels.sum())} px "
+                f"({100 * robot_pixels.mean():.1f}% of frame)"
+            )
         view = {
             "img": img_rgb.astype(np.uint8),
             "intrinsics": torch.from_numpy(K),
@@ -149,15 +300,32 @@ def load_views(
             pose = np.asarray(poses[name], dtype=np.float32)
             view["camera_poses"] = torch.from_numpy(pose)
             view["is_metric_scale"] = torch.ones(1, dtype=torch.bool)
+        if depth_inputs and name in depth_inputs:
+            depth, valid = depth_inputs[name]
+            fed = np.where(valid, depth, 0.0).astype(np.float32)
+            if depth_holdout > 0.0:
+                # Withhold a random subset so the head view keeps pixels the model
+                # never saw; evaluating a fed-in depth against itself is circular.
+                rng = np.random.default_rng(abs(hash((capture, name))) % (2**32))
+                held = rng.random(fed.shape) < float(depth_holdout)
+                fed[held] = 0.0
+            view["depth_z"] = torch.from_numpy(fed)
+            view["is_metric_scale"] = torch.ones(1, dtype=torch.bool)
+            print(
+                f"  depth input: {name} feeding {int((fed > 0).sum())} metric pixels"
+                + (f" (holdout {depth_holdout:.0%})" if depth_holdout > 0 else "")
+            )
         views.append(view)
-    return views, pose_contract
+        undistorted_intrinsics[name] = K.astype(np.float64)
+    return views, pose_contract, undistorted_intrinsics
 
 
-def validate_preprocessed_views(raw_views, processed_views):
-    if len(processed_views) != len(VIEW_NAMES):
-        raise ValueError(f"Expected {len(VIEW_NAMES)} processed views")
-    report = {"view_order": list(VIEW_NAMES), "views": {}}
-    for name, raw, processed in zip(VIEW_NAMES, raw_views, processed_views):
+def validate_preprocessed_views(raw_views, processed_views, view_order=None):
+    view_order = tuple(view_order or VIEW_NAMES)
+    if len(processed_views) != len(view_order):
+        raise ValueError(f"Expected {len(view_order)} processed views")
+    report = {"view_order": list(view_order), "views": {}}
+    for name, raw, processed in zip(view_order, raw_views, processed_views):
         image = processed["img"]
         K = processed["intrinsics"]
         if image.ndim != 4 or image.shape[0] != 1 or image.shape[1] != 3:
@@ -197,6 +365,10 @@ def run_capture(
     ignore_poses=False,
     pose_export_mode=DEFAULT_POSE_EXPORT_MODE,
     memory_efficient_inference=True,
+    use_depth_input=False,
+    depth_holdout=0.0,
+    use_self_mask_input=False,
+    view_order=None,
 ):
     capture_started_at = time.perf_counter()
     timings = {}
@@ -204,19 +376,49 @@ def run_capture(
     os.makedirs(out_dir, exist_ok=True)
     print(f"\n===== {capture} =====")
 
+    self_masks = load_self_occlusion_masks(capture, undist_root)
+    self_mask_report = {}
+    if self_masks:
+        print("  robot self-occlusion masks available for: " + ", ".join(sorted(self_masks)))
+    elif use_self_mask_input:
+        raise FileNotFoundError(
+            f"--self-mask-input was requested but {capture} has no self_occlusion_mask.npz; "
+            "run self_occlusion_mask.py first"
+        )
+
+    view_order = tuple(view_order or VIEW_NAMES)
+    if view_order != tuple(VIEW_NAMES):
+        print(f"  view order: {' -> '.join(view_order)} (default {' -> '.join(VIEW_NAMES)})")
+
+    registered_depth = load_registered_depth(capture, undist_root)
+    if registered_depth:
+        print(
+            "  registered metric depth available for: "
+            + ", ".join(sorted(registered_depth))
+        )
+    elif use_depth_input:
+        raise FileNotFoundError(
+            f"--depth-input was requested but {capture} has no registered_depth.npz; "
+            "run Step A on a capture whose robot provides a metric depth camera"
+        )
+
     section_started_at = time.perf_counter()
-    views, pose_contract = load_views(
+    views, pose_contract, undistorted_K = load_views(
         capture,
         undist_root,
         allow_missing_poses,
         ignore_poses=ignore_poses,
+        depth_inputs=registered_depth if use_depth_input else None,
+        depth_holdout=depth_holdout,
+        self_masks=self_masks if use_self_mask_input else None,
+        view_order=view_order,
     )
     timings["input_load"] = time.perf_counter() - section_started_at
     _print_timing("input_load", timings["input_load"])
 
     section_started_at = time.perf_counter()
     processed = preprocess_inputs(views)
-    preprocess_report = validate_preprocessed_views(views, processed)
+    preprocess_report = validate_preprocessed_views(views, processed, view_order)
     timings["preprocess_inputs"] = time.perf_counter() - section_started_at
     _print_timing("preprocess_inputs", timings["preprocess_inputs"])
     if pose_contract is None and any(v is not None for v in (max_radius, bbox)):
@@ -242,8 +444,8 @@ def run_capture(
     _synchronize_model_device(model)
     timings["model_inference"] = time.perf_counter() - section_started_at
     _print_timing("model_inference", timings["model_inference"])
-    if len(outputs) != len(VIEW_NAMES):
-        raise RuntimeError(f"Model returned {len(outputs)} views, expected {len(VIEW_NAMES)}")
+    if len(outputs) != len(view_order):
+        raise RuntimeError(f"Model returned {len(outputs)} views, expected {len(view_order)}")
 
     section_started_at = time.perf_counter()
     model_pose_arrays = [
@@ -258,6 +460,58 @@ def run_capture(
         if pose_contract is not None
         else None
     )
+    # Compare predicted head depth against the measured metric depth.  This runs
+    # whatever the export mode is: as a standalone quality report by default, and
+    # additionally as the scale estimator when the depth-scaled mode is asked for.
+    depth_scale_inputs = None
+    depth_diagnostic = None
+    if registered_depth:
+        depth_diagnostic = {}
+        for view_index, name in enumerate(view_order):
+            if name not in registered_depth:
+                continue
+            model_depth = (
+                outputs[view_index]["depth_z"][0].squeeze(-1).detach().cpu().numpy()
+                .astype(np.float64)
+            )
+            reference, valid = registered_depth[name]
+            reference, valid = resample_depth_to(reference, valid, model_depth.shape)
+            entry = estimate_depth_similarity_scale(model_depth, reference, valid)
+            entry["was_fed_to_model"] = bool(use_depth_input)
+            entry["depth_holdout_fraction"] = float(depth_holdout)
+            if use_depth_input and depth_holdout <= 0.0:
+                entry["evaluation_warning"] = (
+                    "this depth was fed to the model, so agreement here is circular; "
+                    "use --depth-holdout or judge the views that were not fed"
+                )
+            depth_diagnostic[name] = entry
+            print(
+                f"  depth check[{name}]: "
+                + (
+                    f"scale={entry['scale']:.6f} "
+                    f"residual RMSE={entry['residual_rmse_m'] * 1000:.1f} mm "
+                    f"median={entry['residual_median_abs_m'] * 1000:.1f} mm "
+                    f"inliers={entry['inlier_ratio']:.1%} "
+                    f"affine b={entry['affine_test']['b_m'] * 1000:+.1f} mm "
+                    f"over {entry['pixel_count']} px"
+                    if entry.get("converged")
+                    else f"not usable ({entry.get('reason')})"
+                )
+            )
+        head_view = view_order[0]
+        if head_view in registered_depth:
+            model_depth = (
+                outputs[0]["depth_z"][0].squeeze(-1).detach().cpu().numpy().astype(np.float64)
+            )
+            reference, valid = resample_depth_to(
+                *registered_depth[head_view], model_depth.shape
+            )
+            depth_scale_inputs = {
+                "model_depth": model_depth,
+                "reference_depth": reference,
+                "valid": valid,
+            }
+
     (
         export_pose_arrays,
         effective_pose_mode,
@@ -268,6 +522,7 @@ def run_capture(
             model_pose_arrays,
             calibrated_pose_arrays,
             requested_mode=pose_export_mode,
+            depth_scale_inputs=depth_scale_inputs,
         )
     )
     pose_mode_labels = {
@@ -283,6 +538,17 @@ def run_capture(
         f"effective={effective_pose_mode}"
     )
     similarity_scale = scale_report["scale"] if scale_report is not None else 1.0
+    # Only the affine diagnostic mode sets an offset; every other mode leaves
+    # this at zero and stays a pure similarity transform.
+    depth_offset_m = (
+        float(scale_report.get("depth_offset_m", 0.0)) if scale_report else 0.0
+    )
+    if depth_offset_m:
+        print(
+            f"  DIAGNOSTIC affine depth correction: depth = {similarity_scale:.6f} * model "
+            f"{depth_offset_m:+.4f} m -- this warps geometry and breaks cross-camera "
+            "agreement; do not plan against this output"
+        )
     scale_metadata = scale_report or {
         "applied": False,
         "scale": 1.0,
@@ -307,13 +573,18 @@ def run_capture(
         "pose_contract": pose_contract,
         "preprocess_validation": preprocess_report,
         "memory_efficient_inference": bool(memory_efficient_inference),
+        "view_order": list(view_order),
         "pose_export_mode_requested": pose_export_mode,
         "pose_export_mode_effective": effective_pose_mode,
         "camera_pose_used_for_export": pose_mode_labels[effective_pose_mode],
         "similarity_scale_correction": scale_metadata,
+        "metric_depth_diagnostic": depth_diagnostic,
+        # Bound by reference, not frozen: this dict is filled during the
+        # per-view loop below, after the first summary block is built.
+        "self_occlusion_mask": self_mask_report,
         "pose_anchor": (
             {
-                "reference_view": VIEW_NAMES[0],
+                "reference_view": view_order[0],
                 "operation": (
                     "uniform_similarity_about_model_head_then_rigid_head_anchor"
                     if scale_report is not None
@@ -336,11 +607,12 @@ def run_capture(
     npz["pose_export_similarity_scale"] = np.asarray(
         similarity_scale, dtype=np.float32
     )
+    npz["pose_export_depth_offset_m"] = np.asarray(depth_offset_m, dtype=np.float32)
 
     for view_idx, pred in enumerate(outputs):
-        name = VIEW_NAMES[view_idx]
+        name = view_order[view_idx]
         model_depthmap = pred["depth_z"][0].squeeze(-1)  # (H, W), already metric-head scaled
-        depthmap = model_depthmap * similarity_scale
+        depthmap = model_depthmap * similarity_scale + depth_offset_m
         intrinsics = pred["intrinsics"][0]  # (3, 3)
         model_cam_pose = pred["camera_poses"][0]
         # Keep network depth and network relative camera geometry self-consistent.
@@ -357,6 +629,23 @@ def run_capture(
 
         mask = pred["mask"][0].squeeze(-1).cpu().numpy().astype(bool)
         mask = mask & valid_mask.cpu().numpy()
+        # Drop the robot's own body from the output whether or not it was hidden
+        # from the model.  Blanking the input is an experiment; removing the
+        # robot from the exported cloud is always right, because those points
+        # are the robot, not the scene it has to avoid.
+        if self_masks and name in self_masks:
+            # Map through the intrinsics: preprocessing cropped as well as
+            # resized, so the output grid covers only part of the input frame.
+            robot_pixels = reproject_mask_with_intrinsics(
+                self_masks[name], undistorted_K[name], K_np, mask.shape
+            )
+            removed = int((mask & robot_pixels).sum())
+            mask = mask & ~robot_pixels
+            self_mask_report[name] = {
+                "removed_points": removed,
+                "mask_coverage_fraction": float(robot_pixels.mean()),
+                "blanked_before_inference": bool(use_self_mask_input),
+            }
         pts3d_np = pts3d.cpu().numpy()
         image_np = pred["img_no_norm"][0].cpu().numpy()  # (H, W, 3) in [0, 1]
         depth_np = depthmap.cpu().numpy()
@@ -458,15 +747,20 @@ def run_capture(
     for i in range(len(cam_translations)):
         for j in range(i + 1, len(cam_translations)):
             d = float(np.linalg.norm(cam_translations[i] - cam_translations[j]))
-            key = f"{VIEW_NAMES[i]}__{VIEW_NAMES[j]}"
+            key = f"{view_order[i]}__{view_order[j]}"
             baselines[key] = round(d, 4)
     summary["baselines_m"] = baselines
     print(f"  baselines(m): {baselines}")
 
-    # Stack for GLB (all views share the unified resolution after preprocess_inputs)
-    world_points = np.stack(world_points_list, axis=0)
-    images = np.stack(images_list, axis=0)
-    final_masks = np.stack(masks_list, axis=0)
+    # Stack for GLB/PLY in the declared view order, never the feed order.  The
+    # order views are given to the model is an inference-time detail, but the
+    # exported point sequence is a contract: filter_export replays scene.ply
+    # point by point, so a reordered export silently compares each view against
+    # a different one.
+    canonical = [view_order.index(name) for name in VIEW_NAMES]
+    world_points = np.stack([world_points_list[i] for i in canonical], axis=0)
+    images = np.stack([images_list[i] for i in canonical], axis=0)
+    final_masks = np.stack([masks_list[i] for i in canonical], axis=0)
 
     # Optional export filters (stackable); geometry in views.npz stays unfiltered.
     if any(f is not None for f in (max_radius, bbox, min_conf)):
@@ -546,13 +840,18 @@ def run_capture(
         "translation_unit": (
             "meter" if pose_contract is not None else "arbitrary_model_scale"
         ),
+        "view_order": list(view_order),
         "pose_export_mode_requested": pose_export_mode,
         "pose_export_mode_effective": effective_pose_mode,
         "similarity_scale_correction": scale_metadata,
+        "metric_depth_diagnostic": depth_diagnostic,
+        # Bound by reference, not frozen: this dict is filled during the
+        # per-view loop below, after the first summary block is built.
+        "self_occlusion_mask": self_mask_report,
         "anchor": summary["pose_anchor"],
         "poses": {
             name: export_pose_arrays[index].tolist()
-            for index, name in enumerate(VIEW_NAMES)
+            for index, name in enumerate(view_order)
         },
     }
     export_pose_filename = "camera_poses_used_for_export.json"
@@ -608,7 +907,51 @@ def main():
             "Final geometry when metric poses are supplied. Default estimates one "
             "uniform scale from calibrated/model camera baselines, applies it to "
             "model depth and relative translations, then anchors the calibrated "
-            "head. Other choices preserve the unscaled model geometry or legacy hybrid."
+            "head. depth-scaled instead fits that scale per pixel against a metric "
+            "depth camera and falls back to the baseline fit if the depth fit cannot "
+            "be defended. Other choices preserve the unscaled model geometry or "
+            "legacy hybrid."
+        ),
+    )
+    parser.add_argument(
+        "--depth-input",
+        action="store_true",
+        help=(
+            "Feed the registered metric depth to the model as a per-view depth_z "
+            "prior instead of only using it afterwards. Requires a robot with a "
+            "metric depth camera (G2)."
+        ),
+    )
+    parser.add_argument(
+        "--view-order",
+        default=None,
+        metavar="head,hand_x,hand_y",
+        help=(
+            "Order the views are fed to the model, as a permutation of "
+            f"{','.join(VIEW_NAMES)}. Outputs stay keyed by name. View 0 must "
+            "stay the head. Swapping the two wrist views separates whether the "
+            "consistently worst view is worst because of its camera geometry or "
+            "because of its index, since the model makes all poses relative to "
+            "view 0."
+        ),
+    )
+    parser.add_argument(
+        "--self-mask-input",
+        action="store_true",
+        help=(
+            "Blank the robot's own pixels before inference, to test whether the "
+            "gripper filling the wrist view distorts the estimate. Robot points "
+            "are removed from the exported cloud regardless of this flag."
+        ),
+    )
+    parser.add_argument(
+        "--depth-holdout",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of depth pixels to withhold from --depth-input so the "
+            "diagnostic still has pixels the model never saw. Without it, agreement "
+            "on a fed-in view is circular and proves nothing."
         ),
     )
     parser.add_argument(
@@ -647,6 +990,7 @@ def main():
         help="Export filter: keep points with confidence >= this value",
     )
     args = parser.parse_args()
+    view_order = resolve_view_order(args.view_order)
     run_started_at = time.perf_counter()
     captures = resolve_captures(args.input_root, args.captures, preprocessed=True)
     filter_kwargs = dict(
@@ -657,7 +1001,7 @@ def main():
         print(f"Validating captures: {', '.join(captures)}")
         for capture in captures:
             print(f"\n===== {capture} =====")
-            views, contract = load_views(
+            views, contract, _ = load_views(
                 capture,
                 args.input_root,
                 args.allow_missing_poses,
@@ -700,6 +1044,10 @@ def main():
                 allow_missing_poses=args.allow_missing_poses,
                 ignore_poses=args.ignore_poses,
                 pose_export_mode=args.pose_export_mode,
+                use_depth_input=args.depth_input,
+                depth_holdout=args.depth_holdout,
+                use_self_mask_input=args.self_mask_input,
+                view_order=view_order,
                 memory_efficient_inference=not args.fast_inference,
                 **filter_kwargs,
             )
@@ -718,6 +1066,10 @@ def main():
                 allow_missing_poses=args.allow_missing_poses,
                 ignore_poses=args.ignore_poses,
                 pose_export_mode=args.pose_export_mode,
+                use_depth_input=args.depth_input,
+                depth_holdout=args.depth_holdout,
+                use_self_mask_input=args.self_mask_input,
+                view_order=view_order,
                 memory_efficient_inference=True,
                 **filter_kwargs,
             )
