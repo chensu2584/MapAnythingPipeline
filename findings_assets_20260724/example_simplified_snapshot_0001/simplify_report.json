@@ -1,0 +1,79 @@
+{
+  "voxel_size_m": 0.009999999776482582,
+  "world_frame": "base_link",
+  "input_voxels": 61537,
+  "removed_gripper": 1082,
+  "removed_low_count": 0,
+  "removed_low_conf": 0,
+  "removed_noise_clusters": 213,
+  "kept_voxels": 60242,
+  "ground_plane": {
+    "method": "z_histogram_mode",
+    "table_top_z": 0.6595,
+    "mode_z": 0.6295,
+    "obstacle_cut_z": 0.6995,
+    "peak_voxels": 6920
+  },
+  "obstacle_voxels": 837,
+  "ground_voxels": 59405,
+  "obstacle_boxes": [
+    {
+      "id": 0,
+      "center_m": [
+        0.5077,
+        0.3107,
+        0.7345
+      ],
+      "size_m": [
+        0.07,
+        0.06,
+        0.05
+      ],
+      "min_m": [
+        0.4727,
+        0.2807,
+        0.7095
+      ],
+      "max_m": [
+        0.5427,
+        0.3407,
+        0.7595
+      ],
+      "voxel_count": 93,
+      "color": [
+        61,
+        65,
+        68
+      ]
+    },
+    {
+      "id": 1,
+      "center_m": [
+        0.8877,
+        -0.0443,
+        0.7395
+      ],
+      "size_m": [
+        0.23,
+        0.37,
+        0.06
+      ],
+      "min_m": [
+        0.7727,
+        -0.2293,
+        0.7095
+      ],
+      "max_m": [
+        1.0027,
+        0.1407,
+        0.7695
+      ],
+      "voxel_count": 724,
+      "color": [
+        69,
+        79,
+        153
+      ]
+    }
+  ]
+}
