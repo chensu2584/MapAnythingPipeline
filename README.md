@@ -134,6 +134,45 @@ Image preprocessing remains enabled: pose/intrinsic preservation checks and edge
 masking affect reconstruction validity and are not removed for speed. The GUI sends
 all selected captures to one inference process, so model weights load once per batch.
 
+## G2 capture-to-three-version GUI
+
+`g2_full_pipeline_gui.py` is the production G2 entry point from live image capture
+through MapAnything inference, direct-depth reconstruction and occupancy fusion:
+
+```bash
+cd /home/ck/MapAnythingTest/MapAnythingPipeline
+conda run --no-capture-output -n MAP python g2_full_pipeline_gui.py
+```
+
+The capture button directly runs the designated
+`../g2_four_camera_extrinsic_capture.py`; image synchronisation, live joint reads,
+URDF FK, sensor calibration and `base_T_camera` export are not reimplemented in
+the GUI. The production profile feeds all metric depth, uses zero holdout,
+baseline-scaled/head-anchored model geometry, normal three-view order, 1.0 m wrist
+depth caps, 2.3 m radius and 1 cm voxels. Roll normalisation and URDF self-mask input
+remain disabled.
+
+Every selected Snapshot produces three final versions under
+`<run>/versions/<snapshot>/`:
+
+- `depth_only_voxels.{npz,glb}`;
+- `fused_voxels.{npz,glb}`;
+- `mapanything_only_voxels.{npz,glb}`.
+
+All three pass through the same measured table XY crop (default
+`X=[0.239,1.019]`, `Y=[-0.694,0.706]` in `base_link` metres), gripper proxy
+removal, DBSCAN denoise and below-table crop. Intermediate files under `map/` and
+`depth/` are retained as evidence and are not the final uniformly cropped
+contract. Final GLBs use captured colour, hide gripper-removal shells and include
+the base origin, three cameras, two flange references and simplified hands.
+
+Configuration, capture-script hash, processing parameters and final paths are
+recorded in `<run>/g2_full_pipeline_config.json`. Completion additionally writes
+`<run>/three_version_validation.json` only after reloading every final NPZ and
+confirming all voxel centres lie inside the selected table XY bounds. Full
+operation, output semantics, validation results and hardware limitations are in
+[`G2_FULL_PIPELINE_GUI.md`](G2_FULL_PIPELINE_GUI.md).
+
 ## G2 support
 
 `--robot g2` (or auto-detection from the folder layout) reads a G2 capture

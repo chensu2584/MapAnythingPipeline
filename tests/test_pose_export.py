@@ -7,8 +7,12 @@ from pose_export import (
     MODEL_PREDICTION_ARBITRARY_SCALE,
     MODEL_RELATIVE_HEAD_ANCHORED,
     MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED,
+    MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_AFFINE,
+    MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_SCALED,
     estimate_baseline_similarity_scale,
+    format_similarity_scale_report,
     pose_delta,
+    pose_export_geometry_label,
     select_export_poses,
 )
 
@@ -103,6 +107,44 @@ class PoseExportTests(unittest.TestCase):
                 poses[first][:3, 3] - poses[second][:3, 3]
             )
             self.assertAlmostEqual(final_baseline, calibrated_baseline)
+
+    def test_similarity_scale_report_formats_baseline_and_depth_estimators(self):
+        baseline = format_similarity_scale_report(
+            {
+                "scale": 1.04,
+                "baseline_rmse_before_m": 0.013,
+                "baseline_rmse_after_m": 0.003,
+            }
+        )
+        self.assertIn("baseline similarity scale: 1.040000", baseline)
+        self.assertIn("13.00 -> 3.00 mm", baseline)
+
+        depth = format_similarity_scale_report(
+            {
+                "scale": 1.0055,
+                "residual_median_abs_m": 0.0076,
+                "inlier_ratio": 0.88,
+            }
+        )
+        self.assertIn("depth similarity scale: 1.005500", depth)
+        self.assertIn("median residual 7.60 mm", depth)
+        self.assertIn("inliers 88.0%", depth)
+
+    def test_every_effective_export_mode_has_a_geometry_label(self):
+        modes = (
+            MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED,
+            MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_SCALED,
+            MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_AFFINE,
+            MODEL_RELATIVE_HEAD_ANCHORED,
+            CALIBRATED_INPUT,
+            MODEL_PREDICTION_ARBITRARY_SCALE,
+        )
+        for mode in modes:
+            with self.subTest(mode=mode):
+                self.assertTrue(pose_export_geometry_label(mode))
+
+        with self.assertRaises(ValueError):
+            pose_export_geometry_label("not-a-mode")
 
 
 if __name__ == "__main__":

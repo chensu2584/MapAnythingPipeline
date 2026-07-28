@@ -45,7 +45,9 @@ from pose_export import (
     MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_SCALED,
     POSE_EXPORT_MODES,
     estimate_depth_similarity_scale,
+    format_similarity_scale_report,
     pose_delta,
+    pose_export_geometry_label,
     select_export_poses,
 )
 from capture_contract import (
@@ -613,14 +615,6 @@ def run_capture(
             depth_scale_inputs=depth_scale_inputs,
         )
     )
-    pose_mode_labels = {
-        MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED: (
-            "model_prediction_baseline_scaled_and_rigidly_anchored_to_calibrated_head"
-        ),
-        MODEL_RELATIVE_HEAD_ANCHORED: "model_prediction_rigidly_anchored_to_calibrated_head",
-        CALIBRATED_INPUT: "calibrated_input_pose_legacy_hybrid",
-        MODEL_PREDICTION_ARBITRARY_SCALE: "model_prediction_arbitrary_scale",
-    }
     print(
         f"  pose export mode: requested={pose_export_mode}, "
         f"effective={effective_pose_mode}"
@@ -643,11 +637,7 @@ def run_capture(
         "estimator": None,
     }
     if scale_report is not None:
-        print(
-            f"  baseline similarity scale: {similarity_scale:.6f} | "
-            f"baseline RMSE {scale_report['baseline_rmse_before_m'] * 1000:.2f} -> "
-            f"{scale_report['baseline_rmse_after_m'] * 1000:.2f} mm"
-        )
+        print(f"  {format_similarity_scale_report(scale_report)}")
 
     world_points_list = []
     images_list = []
@@ -667,7 +657,7 @@ def run_capture(
         "roll_normalized_deg": roll_report or None,
         "pose_export_mode_requested": pose_export_mode,
         "pose_export_mode_effective": effective_pose_mode,
-        "camera_pose_used_for_export": pose_mode_labels[effective_pose_mode],
+        "camera_pose_used_for_export": pose_export_geometry_label(effective_pose_mode),
         "similarity_scale_correction": scale_metadata,
         "metric_depth_diagnostic": depth_diagnostic,
         # Bound by reference, not frozen: this dict is filled during the

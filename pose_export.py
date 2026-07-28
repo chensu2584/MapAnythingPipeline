@@ -33,6 +33,23 @@ POSE_EXPORT_MODES = (
 DIAGNOSTIC_ONLY_MODES = frozenset({MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_AFFINE})
 DEFAULT_POSE_EXPORT_MODE = MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED
 
+POSE_EXPORT_GEOMETRY_LABELS = {
+    MODEL_RELATIVE_HEAD_ANCHORED_BASELINE_SCALED: (
+        "model_prediction_baseline_scaled_and_rigidly_anchored_to_calibrated_head"
+    ),
+    MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_SCALED: (
+        "model_prediction_depth_scaled_and_rigidly_anchored_to_calibrated_head"
+    ),
+    MODEL_RELATIVE_HEAD_ANCHORED_DEPTH_AFFINE: (
+        "model_prediction_depth_affine_diagnostic_and_rigidly_anchored_to_calibrated_head"
+    ),
+    MODEL_RELATIVE_HEAD_ANCHORED: (
+        "model_prediction_rigidly_anchored_to_calibrated_head"
+    ),
+    CALIBRATED_INPUT: "calibrated_input_pose_legacy_hybrid",
+    MODEL_PREDICTION_ARBITRARY_SCALE: "model_prediction_arbitrary_scale",
+}
+
 # A depth-anchored scale is only trusted when the robust fit actually had
 # something to work with.  Below these the mode falls back to the baseline fit
 # and records why, rather than silently exporting a scale nobody can defend.
@@ -223,6 +240,32 @@ def estimate_depth_similarity_scale(
             "estimator": "robust_per_pixel_metric_depth",
         }
     return {"applied": True, **result, "estimator": "robust_per_pixel_metric_depth"}
+
+
+def format_similarity_scale_report(report: dict) -> str:
+    """Format either a baseline- or depth-derived similarity scale report."""
+
+    scale = float(report["scale"])
+    if "baseline_rmse_before_m" in report:
+        return (
+            f"baseline similarity scale: {scale:.6f} | baseline RMSE "
+            f"{float(report['baseline_rmse_before_m']) * 1000:.2f} -> "
+            f"{float(report['baseline_rmse_after_m']) * 1000:.2f} mm"
+        )
+    return (
+        f"depth similarity scale: {scale:.6f} | median residual "
+        f"{float(report['residual_median_abs_m']) * 1000:.2f} mm, "
+        f"inliers {float(report['inlier_ratio']):.1%}"
+    )
+
+
+def pose_export_geometry_label(mode: str) -> str:
+    """Return the persisted summary label for every effective export mode."""
+
+    try:
+        return POSE_EXPORT_GEOMETRY_LABELS[mode]
+    except KeyError as exc:
+        raise ValueError(f"Unknown effective pose export mode {mode!r}") from exc
 
 
 def select_export_poses(

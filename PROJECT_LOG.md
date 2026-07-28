@@ -1,6 +1,30 @@
 # G2 机器人相机 MapAnything 三维重建 — 工作日志与迁移指南
 
-> 最后更新：2026-07-21。用于未来 resume 工作或迁移到其他机器时快速上手。
+> 最后更新：2026-07-28。用于未来 resume 工作或迁移到其他机器时快速上手。
+
+## 2026-07-28：G2 采集到三版本重建 GUI
+
+- 新增 `g2_full_pipeline.py`：可测试的生产参数、采集命令和处理命令编排，不通过 shell 拼接。
+- 新增 `g2_full_pipeline_gui.py`：响应式 Tk 界面，包含指定四相机采集入口、Snapshot 多选、
+  桌面边界、阶段状态、日志、停止控制和三份最终 GLB 路径。
+- 采集不复制外参实现，直接调用工作区
+  `g2_four_camera_extrinsic_capture.py`；运行前检查最近帧同步、实时关节、FK、传感器标定和
+  `base_T_camera` 等关键契约仍存在。
+- 固定生产推理参数：metric depth 开、holdout 0、baseline-scaled/head-anchored、三路正序、
+  腕部 1.0 m 深度上限、roll normalize 关、self-mask 关、首跑不复用、2.3 m 半径、1 cm
+  体素、memory-efficient inference。
+- Avoid 融合入口现在从同一次清理结果导出 only 深度、occupancy fuse、only MapAnything。
+  三份都使用 GUI 的人工桌面 XY 边界、去夹爪代理盒、DBSCAN 和桌面下方裁剪；正式文件位于
+  `<run>/versions/<snapshot>/`，中间 `map/`、`depth/` GLB 不视为统一裁剪输出。
+- 最终 GLB 使用正常采集颜色、隐藏夹爪删除壳，并统一加入 `base_link` 原点、三处相机、两处
+  法兰参考和简约左右手。简约手不是实机夹爪模型，法兰参考不是 TCP。
+- 配置、参考采集脚本 SHA-256、处理参数和最终路径写入
+  `g2_full_pipeline_config.json`；结束时复读全部最终 NPZ，只有 frame、非空、桌面 XY 和 report
+  参数都通过才写 `three_version_validation.json`。完整说明见 `G2_FULL_PIPELINE_GUI.md`。
+- 验证：Pipeline 106 项测试通过（2 项无显示跳过），Avoid 相关 32 项通过；Tk 建窗冒烟通过。
+  在真实 `040712_0001` 上导出 9,709 / 17,592 / 18,270 个体素，三份桌面 XY 越界均为 0，
+  GLB 均能复读并含完整机器人参考标记。
+- 本次未重新执行 CUDA MapAnything 推理或真机 GDK 采集，不改变 Avoid 的实机执行闭锁。
 
 ## 2026-07-22：G2 支持与重建质量调查
 
