@@ -147,7 +147,10 @@ conda run --no-capture-output -n MAP python g2_full_pipeline_gui.py
 The capture button directly runs the designated
 `../g2_four_camera_extrinsic_capture.py`; image synchronisation, live joint reads,
 URDF FK, sensor calibration and `base_T_camera` export are not reimplemented in
-the GUI. The production profile feeds all metric depth, uses zero holdout,
+the GUI. The target G2 machine provides the complete capture GDK, so Capture
+Python and processing Python default to the current interpreter and need no
+special deployment setup. They remain independently selectable for split-env
+maintenance. The production profile feeds all metric depth, uses zero holdout,
 baseline-scaled/head-anchored model geometry, normal three-view order, 1.0 m wrist
 depth caps, 2.3 m radius and 1 cm voxels. Roll normalisation and URDF self-mask input
 remain disabled.

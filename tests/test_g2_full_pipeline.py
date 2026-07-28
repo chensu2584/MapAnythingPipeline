@@ -98,6 +98,20 @@ class G2FullPipelineTests(unittest.TestCase):
         self.assertEqual(command[command.index("--pose-source") + 1], "fk")
         self.assertNotIn("--oneshot", command)
 
+    def test_capture_and_processing_python_can_be_selected_independently(self):
+        config = fixture_layout(self.tmp_path)
+        config = G2FullPipelineConfig(
+            **{
+                **config.__dict__,
+                "capture_python": "/robot/python",
+                "processing_python": "/map/python",
+            }
+        )
+        _, capture = build_capture_command(config)
+        processing = build_processing_commands(config)
+        self.assertEqual(capture[0], "/robot/python")
+        self.assertTrue(all(command[0] == "/map/python" for _, command in processing))
+
     def test_processing_commands_use_best_production_inference_profile(self):
         config = fixture_layout(self.tmp_path)
         commands = build_processing_commands(config, python_executable="/python")

@@ -68,6 +68,10 @@ class G2FullPipelineGui:
         self.capture_script_var = tk.StringVar(value=str(DEFAULT_CAPTURE_SCRIPT))
         self.g2_root_var = tk.StringVar(value=str(DEFAULT_G2_ROOT))
         self.avoid_root_var = tk.StringVar(value=str(DEFAULT_AVOID_ROOT))
+        self.capture_python_var = tk.StringVar(
+            value=os.environ.get("G2_CAPTURE_PYTHON", sys.executable)
+        )
+        self.processing_python_var = tk.StringVar(value=sys.executable)
         self.device_var = tk.StringVar(value="cuda")
         self.x_min_var = tk.StringVar(value="0.239")
         self.x_max_var = tk.StringVar(value="1.019")
@@ -140,6 +144,8 @@ class G2FullPipelineGui:
         rows = (
             ("运行目录", self.run_root_var, self.choose_run_root, True),
             ("采集参考脚本", self.capture_script_var, self.choose_capture_script, False),
+            ("采集 Python", self.capture_python_var, self.choose_capture_python, False),
+            ("处理 Python", self.processing_python_var, self.choose_processing_python, False),
             ("G2 参数目录", self.g2_root_var, self.choose_g2_root, True),
             ("Avoid 仓库", self.avoid_root_var, self.choose_avoid_root, True),
         )
@@ -334,6 +340,22 @@ class G2FullPipelineGui:
         if value:
             self.capture_script_var.set(value)
 
+    def choose_capture_python(self) -> None:
+        value = filedialog.askopenfilename(
+            initialdir=str(Path(self.capture_python_var.get()).expanduser().parent),
+            filetypes=(("Executable", "*"),),
+        )
+        if value:
+            self.capture_python_var.set(value)
+
+    def choose_processing_python(self) -> None:
+        value = filedialog.askopenfilename(
+            initialdir=str(Path(self.processing_python_var.get()).expanduser().parent),
+            filetypes=(("Executable", "*"),),
+        )
+        if value:
+            self.processing_python_var.set(value)
+
     def choose_g2_root(self) -> None:
         value = filedialog.askdirectory(initialdir=self.g2_root_var.get())
         if value:
@@ -368,6 +390,8 @@ class G2FullPipelineGui:
             g2_root=Path(self.g2_root_var.get()).expanduser(),
             avoid_root=Path(self.avoid_root_var.get()).expanduser(),
             pipeline_root=Path(__file__).resolve().parent,
+            capture_python=self.capture_python_var.get().strip(),
+            processing_python=self.processing_python_var.get().strip(),
             device=self.device_var.get(),
             reuse_preprocessed=bool(self.reuse_var.get()),
         )

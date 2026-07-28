@@ -78,6 +78,8 @@ class G2FullPipelineConfig:
     g2_root: Path = DEFAULT_G2_ROOT
     avoid_root: Path = DEFAULT_AVOID_ROOT
     pipeline_root: Path = SCRIPT_DIR
+    capture_python: str = sys.executable
+    processing_python: str = sys.executable
     device: str = "cuda"
     max_radius_m: float = 2.3
     voxel_size_m: float = 0.01
@@ -201,6 +203,8 @@ class G2FullPipelineConfig:
                 "g2_root": str(self.g2_root.expanduser().resolve()),
                 "avoid_root": str(self.avoid_root.expanduser().resolve()),
                 "pipeline_root": str(self.pipeline_root.expanduser().resolve()),
+                "capture_python": self.capture_python,
+                "processing_python": self.processing_python,
             },
             "captures": list(self.captures),
             "capture_contract": {
@@ -296,10 +300,11 @@ def validate_capture_reference(path: Path) -> str:
 def build_capture_command(
     config: G2FullPipelineConfig,
     *,
-    python_executable: str | Path = sys.executable,
+    python_executable: str | Path | None = None,
 ) -> tuple[str, list[str]]:
     config.validate(require_captures=False)
     validate_capture_reference(config.capture_script)
+    python_executable = python_executable or config.capture_python
     return (
         "four_camera_capture",
         [
@@ -323,10 +328,10 @@ def build_capture_command(
 def build_processing_commands(
     config: G2FullPipelineConfig,
     *,
-    python_executable: str | Path = sys.executable,
+    python_executable: str | Path | None = None,
 ) -> list[tuple[str, list[str]]]:
     config.validate(require_captures=True)
-    py = str(python_executable)
+    py = str(python_executable or config.processing_python)
     pipeline_config = PipelineConfig(
         data_root=config.input_root,
         output_root=config.map_root,

@@ -21,7 +21,10 @@
 - 配置、参考采集脚本 SHA-256、处理参数和最终路径写入
   `g2_full_pipeline_config.json`；结束时复读全部最终 NPZ，只有 frame、非空、桌面 XY 和 report
   参数都通过才写 `three_version_validation.json`。完整说明见 `G2_FULL_PIPELINE_GUI.md`。
-- 验证：Pipeline 106 项测试通过（2 项无显示跳过），Avoid 相关 32 项通过；Tk 建窗冒烟通过。
+- 目标部署机具备完整 G2 采集 GDK；采集与处理 Python 默认相同、无需额外部署配置，同时保留
+  独立选择并写入配置的兼容能力。
+- 验证：Pipeline 108 项测试通过（其中 2 项显示相关测试在桌面环境补跑），Avoid 全套
+  `83 passed, 3 skipped`；Tk 建窗冒烟通过。
   在真实 `040712_0001` 上导出 9,709 / 17,592 / 18,270 个体素，三份桌面 XY 越界均为 0，
   GLB 均能复读并含完整机器人参考标记。
 - 本次未重新执行 CUDA MapAnything 推理或真机 GDK 采集，不改变 Avoid 的实机执行闭锁。
